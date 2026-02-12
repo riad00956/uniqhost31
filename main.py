@@ -494,7 +494,7 @@ def welcome(message):
     
     text = f"""
 🤖 **UNIQUE HOST BD v1.2.0**
-dev: @zerox6t9 <--GET PRIME 👑
+DEV: TEAMZQ © COPYRIGHT ❌ 
 HOST: Asia 🌏 | data: orange 🍊 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
@@ -1282,7 +1282,7 @@ def show_dashboard(call):
 💻 **Hosting Platform:**
 • Platform: PRIME FLOW 
 • Type: Web Service 
-• Region: Asia/kushtia🇧🇩
+• Region: Asia/Sylhet🇧🇩
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1403,9 +1403,9 @@ def show_admin_stats(call):
 • Disk Usage: {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: PRIME FLOW 
+• Platform: XPON 
 • Port: {Config.PORT}
-• Database: prime-print🍊
+• Database: oringe-print🍊
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1488,7 +1488,7 @@ def show_settings(call):
 🌐 **Hosting Info:**
 • Platform: PRIME FLOW 
 • Port: {Config.PORT}
-• Database: prime-print🍊
+• Database: orange-print🍊
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1550,7 +1550,7 @@ def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🤖 Prime Bot Hosting v3.2</title>
+        <title>🤖 unique Bot Hosting v3.2</title>
         <style>
             body {
                 font-family: Arial, sans-serif;
@@ -1696,17 +1696,17 @@ def home():
             </div>
             
             <div style="text-align: center; margin: 40px 0;">
-                <a href="https://t.me/prime_bot_hosting_bot" class="btn" target="_blank">
+                <a href="https://t.me/q1_host_bot" class="btn" target="_blank">
                     <i class="fab fa-telegram"></i> Start on Telegram
                 </a>
-                <a href="https://render.com" class="btn" target="_blank" style="background: linear-gradient(45deg, #00b09b, #96c93d);">
-                    <i class="fas fa-cloud"></i> Hosted on Render
+                <a href="https://cyber20un.onrender.com" class="btn" target="_blank" style="background: linear-gradient(45deg, #00b09b, #96c93d);">
+                    <i class="fas fa-cloud"></i> Hosted on cyber20
                 </a>
             </div>
             
             <div class="footer">
                 <p><i class="fas fa-info-circle"></i> System Port: """ + str(Config.PORT) + """ | Python 3.9+ | SQLite Database</p>
-                <p>© 2024 Prime Bot Hosting. All rights reserved.</p>
+                <p>© 2022 ZQ Bot Hosting. All rights reserved by KI VAIYA 😁</p>
             </div>
         </div>
     </body>
@@ -1716,11 +1716,11 @@ def home():
 
 @app.route('/health')
 def health():
-    return {"status": "healthy", "service": "Prime Bot Hosting v3.2", "port": Config.PORT, "maintenance": Config.MAINTENANCE}
+    return {"status": "healthy", "service": "ZQ Bot Hosting v3.2", "port": Config.PORT, "maintenance": Config.MAINTENANCE}
 
 # ==================== বট ও সার্ভার রানার ====================
 def start_bot():
-    logger.info("🤖 Starting Telegram Bot polling...")
+    logger.info("🤖 BOT RUNNING 👾")
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=60)
