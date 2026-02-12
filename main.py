@@ -31,14 +31,14 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CyberHosting')
+logger = logging.getLogger('PrimeHosting')
 
 # ==================== এনভায়রনমেন্ট কনফিগার ====================
 class Config:
     TOKEN = os.environ.get('BOT_TOKEN')
     ADMIN_ID = os.environ.get('ADMIN_ID')
     PROJECT_DIR = 'projects'
-    DB_NAME = 'cyber_v2.db'
+    DB_NAME = 'prime_v2.db'
     PORT = int(os.environ.get('PORT', 10000))
     MAINTENANCE = False
     
@@ -56,7 +56,6 @@ class Config:
     USE_DOCKER = os.environ.get('USE_DOCKER', 'False').lower() == 'true'
     DOCKER_IMAGE = 'python:3.9-slim'
 
-# টোকেন ও অ্যাডমিন আইডি অবশ্যই সেট থাকতে হবে
 if not Config.TOKEN:
     logger.critical("BOT_TOKEN environment variable not set!")
     sys.exit(1)
@@ -120,11 +119,8 @@ def get_db():
     return db
 
 def init_db():
-    """CREATE TABLE IF NOT EXISTS + স্কিমা আপগ্রেড"""
     with get_db() as conn:
         c = conn.cursor()
-        
-        # ইউজার টেবিল
         c.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             username TEXT,
@@ -134,16 +130,12 @@ def init_db():
             join_date TEXT,
             auto_restart INTEGER DEFAULT 0
         )''')
-        
-        # কী টেবিল
         c.execute('''CREATE TABLE IF NOT EXISTS keys (
             key TEXT PRIMARY KEY,
             duration_days INTEGER,
             file_limit INTEGER,
             created_date TEXT
         )''')
-        
-        # ডিপ্লয়মেন্ট টেবিল (বিদ্যমান থাকলে নতুন কলাম যোগ)
         c.execute('''CREATE TABLE IF NOT EXISTS deployments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -158,34 +150,29 @@ def init_db():
             auto_restart INTEGER DEFAULT 0,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         )''')
-        
-        # পুরনো ডাটাবেজ আপগ্রেড - যদি container_id কলাম না থাকে
+        # পুরনো ডাটাবেজ আপগ্রেড
         try:
             c.execute("SELECT container_id FROM deployments LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE deployments ADD COLUMN container_id TEXT")
-        
         try:
             c.execute("SELECT auto_restart FROM deployments LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE deployments ADD COLUMN auto_restart INTEGER DEFAULT 0")
-        
         try:
             c.execute("SELECT auto_restart FROM users LIMIT 1")
         except sqlite3.OperationalError:
             c.execute("ALTER TABLE users ADD COLUMN auto_restart INTEGER DEFAULT 0")
         
-        # অ্যাডমিন ইউজার (যদি না থাকে)
         join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         c.execute("INSERT OR IGNORE INTO users (id, username, expiry, file_limit, is_prime, join_date) VALUES (?, ?, ?, ?, ?, ?)",
                   (Config.ADMIN_ID, 'admin', None, 999, 1, join_date))
         conn.commit()
-        
         logger.info("Database initialized/upgraded successfully.")
 
 init_db()
 
-# ==================== সিস্টেম মনিটরিং (বাস্তব) ====================
+# ==================== সিস্টেম মনিটরিং ====================
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -202,7 +189,6 @@ def get_system_stats():
             return {'cpu_percent': cpu, 'ram_percent': ram, 'disk_percent': disk}
         except:
             pass
-    # ফলব্যাক
     return {'cpu_percent': random.randint(20, 80), 'ram_percent': random.randint(30, 70), 'disk_percent': random.randint(40, 60)}
 
 def get_process_stats(pid):
@@ -224,7 +210,7 @@ def get_process_stats(pid):
         logger.error(f"Process {pid} check error: {e}")
         return None
 
-# ==================== ডকার আইসোলেশন (ঐচ্ছিক) ====================
+# ==================== ডকার আইসোলেশন ====================
 try:
     import docker
     DOCKER_AVAILABLE = Config.USE_DOCKER and docker.from_env().ping()
@@ -233,15 +219,12 @@ except:
     logger.info("Docker not available. Using subprocess with resource limits.")
 
 class BotRunner:
-    """ইউজার বট চালানোর অ্যাবস্ট্রাকশন"""
-    
     @staticmethod
     def run(user_id, bot_id, filename, bot_name, auto_restart=False):
         file_path = project_path / filename
         if not file_path.exists():
             raise FileNotFoundError(f"File {filename} not found")
         
-        # ইউজারের চলমান বট সংখ্যা চেক
         with get_db() as conn:
             c = conn.cursor()
             count = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (user_id,)).fetchone()[0]
@@ -256,7 +239,6 @@ class BotRunner:
     @staticmethod
     def _run_subprocess(user_id, bot_id, file_path, bot_name, auto_restart):
         try:
-            # রিসোর্স লিমিট (শুধু ইউনিক্স)
             if hasattr(resource, 'RLIMIT_CPU') and hasattr(resource, 'RLIMIT_AS'):
                 try:
                     resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
@@ -331,7 +313,7 @@ class BotRunner:
                 pass
         return False
 
-# ==================== ইউজার বট সুপারভাইজার (অটো-রিস্টার্ট) ====================
+# ==================== ইউজার বট সুপারভাইজার ====================
 class BotSupervisor(threading.Thread):
     def __init__(self, interval=30):
         super().__init__()
@@ -392,7 +374,6 @@ class BotSupervisor(threading.Thread):
                 except Exception as e:
                     logger.error(f"Restart failed for bot {bot_id}: {e}")
 
-# সুপারভাইজার থ্রেড শুরু
 BotSupervisor().start()
 logger.info("Bot supervisor thread started.")
 
@@ -438,7 +419,6 @@ def create_progress_bar(percentage):
     return "█" * bars + "░" * (10 - bars)
 
 def safe_edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode=None):
-    """মেসেজ এডিট করতে ব্যর্থ হলে নতুন মেসেজ পাঠায়"""
     try:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
         return message_id
@@ -447,13 +427,13 @@ def safe_edit_message_text(chat_id, message_id, text, reply_markup=None, parse_m
         msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
         return msg.message_id
 
-# ==================== কীবোর্ড মেনু (সম্পূর্ণ অপরিবর্তিত) ====================
+# ==================== কীবোর্ড মেনু (Prime) ====================
 def main_menu(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     user = get_user(user_id)
     if not is_prime(user_id):
-        markup.add(types.InlineKeyboardButton("🔑 Activate Core Pass", callback_data="activate_prime"))
-        markup.add(types.InlineKeyboardButton("ℹ️ Core Features", callback_data="premium_info"))
+        markup.add(types.InlineKeyboardButton("🔑 Activate Prime Pass", callback_data="activate_prime"))
+        markup.add(types.InlineKeyboardButton("ℹ️ Prime Features", callback_data="prime_info"))
     else:
         markup.add(
             types.InlineKeyboardButton("📤 Upload Bot File", callback_data='upload'),
@@ -484,7 +464,7 @@ def admin_menu():
     )
     return markup
 
-# ==================== কমান্ড হ্যান্ডলার (রেট লিমিটেড) ====================
+# ==================== কমান্ড হ্যান্ডলার ====================
 @bot.message_handler(commands=['start'])
 @rate_limit
 def welcome(message):
@@ -509,12 +489,12 @@ def welcome(message):
         bot.send_message(message.chat.id, "❌ Error loading user data. Please try again.")
         return
     
-    status = "CORE 👑" if is_prime(uid) else "FREE 🆓"
+    status = "PRIME 👑" if is_prime(uid) else "FREE 🆓"
     expiry = user['expiry'] if user['expiry'] else "Not Activated"
     
     text = f"""
-🤖 **UNIQUE HOST BD v1.1.0**
-dev: @zerox6t9 <--GET CORE 👑
+🤖 **UNIQUE HOST BD v1.2.0**
+dev: @zerox6t9 <--GET PRIME 👑
 HOST: Asia 🌏 | data: orange 🍊 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 👤 **User:** @{username}
@@ -523,7 +503,7 @@ HOST: Asia 🌏 | data: orange 🍊
 📅 **Join Date:** {user['join_date']}
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📊 **Account Details:**
-• Plan: {'CORE' if is_prime(uid) else 'Free'}
+• Plan: {'PRIME' if is_prime(uid) else 'Free'}
 • File Limit: `{user['file_limit']}` files
 • Expiry: {expiry}
 ━━━━━━━━━━━━━━━━━━━━━━━━
@@ -550,7 +530,7 @@ Welcome to the admin dashboard. You can manage users, generate keys, and monitor
 """
     bot.send_message(message.chat.id, text, reply_markup=admin_menu(), parse_mode="Markdown")
 
-# ==================== কলব্যাক হ্যান্ডলার (রেট লিমিটেড) ====================
+# ==================== কলব্যাক হ্যান্ডলার ====================
 @bot.callback_query_handler(func=lambda call: True)
 @rate_limit_callback
 def callback_manager(call):
@@ -561,7 +541,7 @@ def callback_manager(call):
     try:
         if call.data == "activate_prime":
             msg = safe_edit_message_text(chat_id, mid, """
-🔑 **ACTIVATE CORE PASS**
+🔑 **ACTIVATE PRIME PASS**
 ━━━━━━━━━━━━━━━━━━━━
 Enter your activation key below.
 Format: `PRIME-XXXXXX`
@@ -571,7 +551,7 @@ Format: `PRIME-XXXXXX`
             
         elif call.data == "upload":
             if not is_prime(uid):
-                bot.answer_callback_query(call.id, "⚠️ Core feature! Activate Core first.")
+                bot.answer_callback_query(call.id, "⚠️ Prime feature! Activate Prime first.")
                 return
             msg = safe_edit_message_text(chat_id, mid, """
 📤 **UPLOAD BOT FILE**
@@ -585,7 +565,7 @@ Please send your Python (.py) bot file.
             
         elif call.data == "deploy_new":
             if not is_prime(uid):
-                bot.answer_callback_query(call.id, "⚠️ Core feature!")
+                bot.answer_callback_query(call.id, "⚠️ Prime feature!")
                 return
             show_available_files(call)
             
@@ -631,14 +611,18 @@ Please send your Python (.py) bot file.
             bot_id = call.data.split("_")[1]
             stop_bot(call, bot_id)
             
+        elif call.data.startswith("start_"):
+            bot_id = call.data.split("_")[1]
+            start_stopped_bot(call, bot_id)
+            
         elif call.data == "install_libs":
             ask_for_libraries(call)
             
         elif call.data == "back_main":
             safe_edit_message_text(chat_id, mid, "🏠 **Main Menu**", reply_markup=main_menu(uid), parse_mode="Markdown")
             
-        elif call.data == "premium_info":
-            show_premium_info(call)
+        elif call.data == "prime_info":
+            show_prime_info(call)
             
         elif call.data == "settings":
             show_settings(call)
@@ -646,14 +630,20 @@ Please send your Python (.py) bot file.
         elif call.data == "maintenance":
             toggle_maintenance(call)
             
+        elif call.data == "notif_settings":
+            bot.answer_callback_query(call.id, "🔔 Notification settings coming soon!")
+            
+        elif call.data == "lang_settings":
+            bot.answer_callback_query(call.id, "🌐 Language settings coming soon!")
+            
     except Exception as e:
         logger.exception(f"Callback error: {call.data}")
         bot.answer_callback_query(call.id, "⚠️ Error occurred!")
 
-# ==================== স্টেপ-বাই-স্টেপ ফাংশন (সংশোধিত) ====================
+# ==================== স্টেপ-বাই-স্টেপ ফাংশন ====================
 def gen_key_step1(call):
     msg = safe_edit_message_text(call.message.chat.id, call.message.message_id, """
-🎫 **GENERATE CORE KEY**
+🎫 **GENERATE PRIME KEY**
 ━━━━━━━━━━━━━━━━━━━━
 Step 1/3: Enter duration in days
 Example: 7, 30, 90, 365
@@ -668,7 +658,7 @@ def gen_key_step2(message, old_mid):
             raise ValueError
         bot.delete_message(message.chat.id, message.message_id)
         msg = bot.send_message(message.chat.id, f"""
-🎫 **GENERATE CORE KEY**
+🎫 **GENERATE PRIME KEY**
 ━━━━━━━━━━━━━━━━━━━━
 Step 2/3: Duration set to **{days} days**
 
@@ -715,11 +705,10 @@ def upload_file_step(message, old_mid):
     chat_id = message.chat.id
     
     if not is_prime(uid):
-        safe_edit_message_text(chat_id, old_mid, "⚠️ **Core Required**\n\nActivate core to upload files.", reply_markup=main_menu(uid), parse_mode="Markdown")
+        safe_edit_message_text(chat_id, old_mid, "⚠️ **Prime Required**\n\nActivate Prime to upload files.", reply_markup=main_menu(uid), parse_mode="Markdown")
         return
     
     if message.content_type == 'document' and message.document.file_name.endswith('.py'):
-        # ফাইল সাইজ চেক
         if message.document.file_size > Config.MAX_FILE_SIZE_MB * 1024 * 1024:
             bot.reply_to(message, f"❌ File too large! Max {Config.MAX_FILE_SIZE_MB}MB.")
             return
@@ -782,7 +771,7 @@ Click 'Install Libraries' to add dependencies.
     bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
     logger.info(f"User {uid} uploaded file {safe_name}")
 
-# ==================== প্যাকেজ ইনস্টলেশন ভ্যালিডেশন ====================
+# ==================== প্যাকেজ ইনস্টলেশন ====================
 ALLOWED_PIP_PACKAGES = {'pyTelegramBotAPI', 'requests', 'beautifulsoup4', 'flask', 'django', 'numpy', 'pandas', 'pillow', 'matplotlib'}
 
 def validate_pip_command(cmd):
@@ -792,7 +781,7 @@ def validate_pip_command(cmd):
     parts = cmd.split()
     if len(parts) < 3:
         return False
-    package = parts[2].split('==')[0].split('>')[0].split('<')[0].split('[')[0]  # ভার্সন ও এক্সট্রা বাদ
+    package = parts[2].split('==')[0].split('>')[0].split('<')[0].split('[')[0]
     if package not in ALLOWED_PIP_PACKAGES:
         logger.warning(f"Blocked pip install attempt: {package}")
         return False
@@ -870,6 +859,7 @@ All libraries installed successfully!
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🚀 Deploy Bot Now", callback_data="deploy_new"))
     markup.add(types.InlineKeyboardButton("🤖 My Bots", callback_data="my_bots"))
+    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))  # ব্যাক বাটন
     
     safe_edit_message_text(chat_id, old_mid, final_text, reply_markup=markup, parse_mode="Markdown")
     logger.info(f"User {uid} installed libraries.")
@@ -878,12 +868,15 @@ def show_available_files(call):
     uid = call.from_user.id
     with get_db() as conn:
         c = conn.cursor()
-        files = c.execute("SELECT filename, bot_name FROM deployments WHERE user_id=? AND pid=0", (uid,)).fetchall()
+        files = c.execute("SELECT filename, bot_name FROM deployments WHERE user_id=? AND (pid IS NULL OR pid=0) AND status='Uploaded'", (uid,)).fetchall()
     
     if not files:
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📤 Upload Bot", callback_data="upload"))
+        markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
         safe_edit_message_text(call.message.chat.id, call.message.message_id, 
                                "📭 **No files available for deployment**\n\nUpload a file first.", 
-                               parse_mode="Markdown")
+                               reply_markup=markup, parse_mode="Markdown")
         return
     
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -912,7 +905,6 @@ def start_deployment(call, filename):
             return
         bot_id, bot_name = bot_info
     
-    # ডিপ্লয়মেন্ট স্টেপ (মূল কোডের স্টাইল অপরিবর্তিত)
     text = f"""
 🚀 **DEPLOYING BOT**
 ━━━━━━━━━━━━━━━━━━━━
@@ -995,13 +987,42 @@ Please check your bot code and try again.
         """
         safe_edit_message_text(chat_id, mid, text, parse_mode="Markdown")
 
+def start_stopped_bot(call, bot_id):
+    """স্টপ করা বট আবার চালু করে"""
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    mid = call.message.message_id
+    
+    with get_db() as conn:
+        c = conn.cursor()
+        bot_info = c.execute("SELECT filename, bot_name FROM deployments WHERE id=? AND user_id=?", (bot_id, uid)).fetchone()
+        if not bot_info:
+            bot.answer_callback_query(call.id, "❌ Bot not found!")
+            return
+        filename, bot_name = bot_info
+    
+    # ডিপ্লয়মেন্ট স্টেপ স্কিপ করে সরাসরি চালানোর চেষ্টা
+    try:
+        runner = BotRunner.run(uid, bot_id, filename, bot_name, auto_restart=False)
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE deployments SET pid=?, container_id=?, start_time=?, status=? WHERE id=?",
+                      (runner.get('pid'), runner.get('container_id'), runner['start_time'], 'Running', bot_id))
+            conn.commit()
+        
+        bot.answer_callback_query(call.id, "✅ Bot started successfully!")
+        # ডিটেইলস পৃষ্ঠা রিফ্রেশ
+        show_bot_details(call, bot_id)
+    except Exception as e:
+        logger.exception(f"Start failed for bot {bot_id}")
+        bot.answer_callback_query(call.id, f"❌ Failed to start: {str(e)[:30]}")
+
 def show_bot_live_stats(call, bot_id, bot_name, pid, container_id):
     chat_id = call.message.chat.id
-    uid = call.from_user.id
     mid = call.message.message_id
     
     def monitor_bot():
-        for i in range(10):  # 10 বার আপডেট
+        for i in range(10):
             try:
                 stats = get_system_stats()
                 cpu_percent = stats['cpu_percent']
@@ -1014,7 +1035,6 @@ def show_bot_live_stats(call, bot_id, bot_name, pid, container_id):
                 ram_bar = create_progress_bar(ram_percent)
                 disk_bar = create_progress_bar(disk_percent)
                 
-                # বট চলছে কিনা চেক
                 if container_id and DOCKER_AVAILABLE:
                     try:
                         client = docker.from_env()
@@ -1129,6 +1149,7 @@ def show_bot_details(call, bot_id):
         bot_info = c.execute("SELECT * FROM deployments WHERE id=?", (bot_id,)).fetchone()
     
     if not bot_info:
+        bot.answer_callback_query(call.id, "❌ Bot not found!")
         return
     
     bot_name = bot_info['bot_name']
@@ -1199,10 +1220,9 @@ def show_bot_details(call, bot_id):
     markup = types.InlineKeyboardMarkup()
     if is_running:
         markup.add(types.InlineKeyboardButton("🛑 Stop Bot", callback_data=f"stop_{bot_id}"))
-    elif pid or container_id:
-        markup.add(types.InlineKeyboardButton("🚀 Start Bot", callback_data=f"start_{bot_id}"))
     else:
-        markup.add(types.InlineKeyboardButton("🚀 Deploy Bot", callback_data=f"deploy_{filename}"))
+        # বট বন্ধ বা ক্র্যাশ করা - স্টার্ট বাটন দেখাও
+        markup.add(types.InlineKeyboardButton("🚀 Start Bot", callback_data=f"start_{bot_id}"))
     
     markup.add(types.InlineKeyboardButton("📊 Refresh Stats", callback_data=f"bot_{bot_id}"))
     markup.add(types.InlineKeyboardButton("🔙 My Bots", callback_data="my_bots"))
@@ -1218,7 +1238,7 @@ def stop_bot(call, bot_id):
             c.execute("UPDATE deployments SET status='Stopped', pid=NULL, container_id=NULL WHERE id=?", (bot_id,))
             conn.commit()
     bot.answer_callback_query(call.id, "✅ Bot stopped successfully!")
-    show_my_bots(call)
+    show_bot_details(call, bot_id)
 
 def show_dashboard(call):
     uid = call.from_user.id
@@ -1245,7 +1265,7 @@ def show_dashboard(call):
 📊 **USER DASHBOARD**
 ━━━━━━━━━━━━━━━━━━━━
 👤 **Account Info:**
-• Status: {'CORE👑' if is_prime(uid) else 'FREE 🆓'}
+• Status: {'PRIME👑' if is_prime(uid) else 'FREE 🆓'}
 • File Limit: {user['file_limit']} files
 • Expiry: {user['expiry'] if user['expiry'] else 'Not set'}
 ━━━━━━━━━━━━━━━━━━━━
@@ -1260,7 +1280,7 @@ def show_dashboard(call):
 • Disk: {disk_bar} {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 💻 **Hosting Platform:**
-• Platform: ULTIMATE FLOW 
+• Platform: PRIME FLOW 
 • Type: Web Service 
 • Region: Asia/kushtia🇧🇩
 ━━━━━━━━━━━━━━━━━━━━
@@ -1301,7 +1321,7 @@ def show_all_users(call):
 👥 **ALL USERS**
 ━━━━━━━━━━━━━━━━━━━━
 📊 **Total Users:** {total_count}
-👑 **Core Users:** {prime_count}
+👑 **Prime Users:** {prime_count}
 🆓 **Free Users:** {total_count - prime_count}
 ━━━━━━━━━━━━━━━━━━━━
 **Recent Users:**
@@ -1383,9 +1403,9 @@ def show_admin_stats(call):
 • Disk Usage: {disk_usage:.1f}%
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: ULTIMATE FLOW 
+• Platform: PRIME FLOW 
 • Port: {Config.PORT}
-• Database: orange-print🍊
+• Database: prime-print🍊
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1416,9 +1436,9 @@ Only admin can access the system when enabled.
     
     safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
 
-def show_premium_info(call):
+def show_prime_info(call):
     text = """
-👑 **CORE FEATURES**
+👑 **PRIME FEATURES**
 ━━━━━━━━━━━━━━━━━━━━
 ✅ **Unlimited Bot Deployment**
 ✅ **Priority Support**
@@ -1429,13 +1449,13 @@ def show_premium_info(call):
 ✅ **24/7 Server Uptime**
 ✅ **No Ads**
 ━━━━━━━━━━━━━━━━━━━━
-💎 **Get core Today!**
-Click 'Activate core Pass' and enter your key.
+💎 **Get Prime Today!**
+Click 'Activate Prime Pass' and enter your key.
 ━━━━━━━━━━━━━━━━━━━━
 """
     
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔑 Activate Core", callback_data="activate_prime"))
+    markup.add(types.InlineKeyboardButton("🔑 Activate Prime", callback_data="activate_prime"))
     markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
     
     safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
@@ -1453,7 +1473,7 @@ def show_settings(call):
 ━━━━━━━━━━━━━━━━━━━━
 👤 **Account Settings:**
 • User ID: `{uid}`
-• Status: {'Core 👑' if is_prime(uid) else 'Free 🆓'}
+• Status: {'Prime 👑' if is_prime(uid) else 'Free 🆓'}
 • File Limit: {user['file_limit']} files
 ━━━━━━━━━━━━━━━━━━━━
 🔧 **Bot Settings:**
@@ -1466,9 +1486,9 @@ def show_settings(call):
 • Reset Settings
 ━━━━━━━━━━━━━━━━━━━━
 🌐 **Hosting Info:**
-• Platform: unauthorized ❌🐍
+• Platform: PRIME FLOW 
 • Port: {Config.PORT}
-• Database: orange-print🍊
+• Database: prime-print🍊
 ━━━━━━━━━━━━━━━━━━━━
 """
     
@@ -1501,9 +1521,9 @@ def process_key_step(message, old_mid):
             conn.commit()
             
             text = f"""
-✅ **CORE ACTIVATED!**
+✅ **PRIME ACTIVATED!**
 ━━━━━━━━━━━━━━━━━━━━
-🎉 Congratulations! You are now a Core member.
+🎉 Congratulations! You are now a Prime member.
 ━━━━━━━━━━━━━━━━━━━━
 📅 **Expiry:** {expiry_date}
 📦 **File Limit:** {limit} files
@@ -1512,7 +1532,7 @@ Enjoy all premium features!
             """
             
             safe_edit_message_text(message.chat.id, old_mid, text, reply_markup=main_menu(uid), parse_mode="Markdown")
-            logger.info(f"User {uid} activated core with key {key_input}")
+            logger.info(f"User {uid} activated prime with key {key_input}")
         else:
             text = """
 ❌ **INVALID KEY**
@@ -1523,14 +1543,14 @@ Please check the key and try again.
             """
             safe_edit_message_text(message.chat.id, old_mid, text, reply_markup=main_menu(uid), parse_mode="Markdown")
 
-# ==================== ফ্লাস্ক রুট (অপরিবর্তিত) ====================
+# ==================== ফ্লাস্ক রুট ====================
 @app.route('/')
 def home():
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🤖 Cyber Bot Hosting v3.1</title>
+        <title>🤖 Prime Bot Hosting v3.2</title>
         <style>
             body {
                 font-family: Arial, sans-serif;
@@ -1611,7 +1631,7 @@ def home():
     </head>
     <body>
         <div class="container">
-            <h1><i class="fas fa-robot"></i> Cyber Bot Hosting v3.1</h1>
+            <h1><i class="fas fa-robot"></i> Prime Bot Hosting v3.2</h1>
             
             <div class="status">
                 <h2><i class="fas fa-server"></i> Server Status: <span style="color: #4CAF50;">✅ ONLINE</span></h2>
@@ -1676,7 +1696,7 @@ def home():
             </div>
             
             <div style="text-align: center; margin: 40px 0;">
-                <a href="https://t.me/cyber_bot_hosting_bot" class="btn" target="_blank">
+                <a href="https://t.me/prime_bot_hosting_bot" class="btn" target="_blank">
                     <i class="fab fa-telegram"></i> Start on Telegram
                 </a>
                 <a href="https://render.com" class="btn" target="_blank" style="background: linear-gradient(45deg, #00b09b, #96c93d);">
@@ -1686,7 +1706,7 @@ def home():
             
             <div class="footer">
                 <p><i class="fas fa-info-circle"></i> System Port: """ + str(Config.PORT) + """ | Python 3.9+ | SQLite Database</p>
-                <p>© 2024 Cyber Bot Hosting. All rights reserved.</p>
+                <p>© 2024 Prime Bot Hosting. All rights reserved.</p>
             </div>
         </div>
     </body>
@@ -1696,7 +1716,7 @@ def home():
 
 @app.route('/health')
 def health():
-    return {"status": "healthy", "service": "Cyber Bot Hosting v3.1", "port": Config.PORT, "maintenance": Config.MAINTENANCE}
+    return {"status": "healthy", "service": "Prime Bot Hosting v3.2", "port": Config.PORT, "maintenance": Config.MAINTENANCE}
 
 # ==================== বট ও সার্ভার রানার ====================
 def start_bot():
@@ -1710,7 +1730,7 @@ def start_bot():
 
 if __name__ == '__main__':
     logger.info(f"""
-🤖 CYBER BOT HOSTING v3.1
+🤖 PRIME BOT HOSTING v3.2
 ━━━━━━━━━━━━━━━━━━━━
 🚀 Starting on Zen bot
 • Port: {Config.PORT}
