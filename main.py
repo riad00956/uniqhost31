@@ -1,1751 +1,859 @@
+#!/usr/bin/env python3
+"""
+Simple Yet Powerful Telegram Voting Board with User Local VPS Mode
+Lightweight, beginner-friendly, modular, secure.
+Run: python bot_server.py
+"""
 
 import os
-import subprocess
-import sqlite3
-import telebot
-import threading
-import time
-import uuid
-import signal
-import random
-import platform
-import logging
-import re
-import resource
 import sys
 import json
-from pathlib import Path
-from telebot import types
-from datetime import datetime, timedelta
-from werkzeug.utils import secure_filename
-from flask import Flask, render_template_string
+import uuid
+import socket
+import logging
+import threading
+import sqlite3
+from datetime import datetime, timezone
 from functools import wraps
-from collections import defaultdict
 
-# ==================== লগিং কনফিগারেশন ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot_hosting.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger('PrimeHosting')
+# Required libraries
+from dotenv import load_dotenv, set_key
+import telebot
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from flask import Flask, request, render_template_string, session, redirect, url_for, abort
 
-# ==================== এনভায়রনমেন্ট কনফিগার ====================
-class Config:
-    TOKEN = os.environ.get('BOT_TOKEN')
-    ADMIN_ID = os.environ.get('ADMIN_ID')
-    PROJECT_DIR = 'projects'
-    DB_NAME = 'prime_v2.db'
-    PORT = int(os.environ.get('PORT', 10000))
-    MAINTENANCE = False
-    
-    # রেট লিমিট
-    RATE_LIMIT = 5
-    RATE_WINDOW = 10
-    
-    # ইউজার বটের জন্য সীমা
-    MAX_CPU_PERCENT = 50
-    MAX_RAM_MB = 200
-    MAX_PROCESSES = 3
-    MAX_FILE_SIZE_MB = 5
-    
-    # ডকার (ঐচ্ছিক)
-    USE_DOCKER = os.environ.get('USE_DOCKER', 'False').lower() == 'true'
-    DOCKER_IMAGE = 'python:3.9-slim'
-
-if not Config.TOKEN:
-    logger.critical("BOT_TOKEN environment variable not set!")
-    sys.exit(1)
-if not Config.ADMIN_ID:
-    logger.critical("ADMIN_ID environment variable not set!")
-    sys.exit(1)
-try:
-    Config.ADMIN_ID = int(Config.ADMIN_ID)
-except:
-    logger.critical("ADMIN_ID must be an integer!")
-    sys.exit(1)
-
-bot = telebot.TeleBot(Config.TOKEN)
-project_path = Path(Config.PROJECT_DIR)
-project_path.mkdir(exist_ok=True)
-app = Flask(__name__)
-
-# ==================== রেট লিমিটার ====================
-class RateLimiter:
-    def __init__(self):
-        self.user_commands = defaultdict(list)
-        self.lock = threading.Lock()
-    
-    def is_allowed(self, user_id):
-        with self.lock:
-            now = time.time()
-            self.user_commands[user_id] = [t for t in self.user_commands[user_id] if now - t < Config.RATE_WINDOW]
-            if len(self.user_commands[user_id]) >= Config.RATE_LIMIT:
-                return False
-            self.user_commands[user_id].append(now)
-            return True
-
-rate_limiter = RateLimiter()
-
-def rate_limit(func):
-    @wraps(func)
-    def wrapper(message, *args, **kwargs):
-        uid = message.from_user.id
-        if not rate_limiter.is_allowed(uid):
-            bot.reply_to(message, "⏳ **Too many requests!** Please slow down.", parse_mode="Markdown")
-            return
-        return func(message, *args, **kwargs)
-    return wrapper
-
-def rate_limit_callback(func):
-    @wraps(func)
-    def wrapper(call, *args, **kwargs):
-        uid = call.from_user.id
-        if not rate_limiter.is_allowed(uid):
-            bot.answer_callback_query(call.id, "⏳ Too many requests! Slow down.")
-            return
-        return func(call, *args, **kwargs)
-    return wrapper
-
-# ==================== ডাটাবেজ ম্যানেজার ====================
-def get_db():
-    db = sqlite3.connect(Config.DB_NAME, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    db.execute("PRAGMA journal_mode = WAL")
-    return db
-
-def init_db():
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            username TEXT,
-            expiry TEXT,
-            file_limit INTEGER DEFAULT 0,
-            is_prime INTEGER DEFAULT 0,
-            join_date TEXT,
-            auto_restart INTEGER DEFAULT 0
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS keys (
-            key TEXT PRIMARY KEY,
-            duration_days INTEGER,
-            file_limit INTEGER,
-            created_date TEXT
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS deployments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            bot_name TEXT,
-            filename TEXT,
-            pid INTEGER,
-            container_id TEXT,
-            start_time TEXT,
-            status TEXT,
-            cpu_usage REAL,
-            ram_usage REAL,
-            auto_restart INTEGER DEFAULT 0,
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-        )''')
-        # পুরনো ডাটাবেজ আপগ্রেড
-        try:
-            c.execute("SELECT container_id FROM deployments LIMIT 1")
-        except sqlite3.OperationalError:
-            c.execute("ALTER TABLE deployments ADD COLUMN container_id TEXT")
-        try:
-            c.execute("SELECT auto_restart FROM deployments LIMIT 1")
-        except sqlite3.OperationalError:
-            c.execute("ALTER TABLE deployments ADD COLUMN auto_restart INTEGER DEFAULT 0")
-        try:
-            c.execute("SELECT auto_restart FROM users LIMIT 1")
-        except sqlite3.OperationalError:
-            c.execute("ALTER TABLE users ADD COLUMN auto_restart INTEGER DEFAULT 0")
-        
-        join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        c.execute("INSERT OR IGNORE INTO users (id, username, expiry, file_limit, is_prime, join_date) VALUES (?, ?, ?, ?, ?, ?)",
-                  (Config.ADMIN_ID, 'admin', None, 999, 1, join_date))
-        conn.commit()
-        logger.info("Database initialized/upgraded successfully.")
-
-init_db()
-
-# ==================== সিস্টেম মনিটরিং ====================
+# Optional: system monitoring
 try:
     import psutil
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
-    logger.warning("psutil not installed. Using dummy stats.")
 
-def get_system_stats():
-    if PSUTIL_AVAILABLE:
-        try:
-            cpu = psutil.cpu_percent(interval=0.1)
-            ram = psutil.virtual_memory().percent
-            disk = psutil.disk_usage('/').percent
-            return {'cpu_percent': cpu, 'ram_percent': ram, 'disk_percent': disk}
-        except:
-            pass
-    return {'cpu_percent': random.randint(20, 80), 'ram_percent': random.randint(30, 70), 'disk_percent': random.randint(40, 60)}
+# ==================== CONFIGURATION ====================
 
-def get_process_stats(pid):
-    if not pid or pid <= 0:
-        return None
-    try:
-        if PSUTIL_AVAILABLE:
-            proc = psutil.Process(pid)
-            with proc.oneshot():
-                cpu = proc.cpu_percent(interval=0.1)
-                mem = proc.memory_info().rss / 1024 / 1024
-                return {'running': True, 'cpu': cpu, 'ram': mem}
-        else:
-            os.kill(pid, 0)
-            return {'running': True, 'cpu': 0, 'ram': 0}
-    except (psutil.NoSuchProcess, ProcessLookupError):
-        return {'running': False, 'cpu': 0, 'ram': 0}
-    except Exception as e:
-        logger.error(f"Process {pid} check error: {e}")
-        return None
+ENV_FILE = ".env"
+load_dotenv(ENV_FILE)
 
-# ==================== ডকার আইসোলেশন ====================
+# Core constants
+DEFAULT_CORE_KEY = "CORE-TWDHREXC288"
+DEFAULT_PORT = 5000
+
+# Instance identity – auto‑generate if missing
+INSTANCE_ID = os.getenv("INSTANCE_ID")
+if not INSTANCE_ID:
+    INSTANCE_ID = str(uuid.uuid4())
+    set_key(ENV_FILE, "INSTANCE_ID", INSTANCE_ID)
+
+INSTANCE_SECRET = os.getenv("INSTANCE_SECRET")
+if not INSTANCE_SECRET:
+    INSTANCE_SECRET = str(uuid.uuid4())
+    set_key(ENV_FILE, "INSTANCE_SECRET", INSTANCE_SECRET)
+
+# User settings from .env (must be provided by user)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", DEFAULT_PORT))
+OWNER_ID = os.getenv("OWNER_ID")
+CORE_KEY = os.getenv("CORE_KEY", DEFAULT_CORE_KEY)
+
+# Validate essential settings
+if not BOT_TOKEN or not OWNER_ID:
+    logging.error("BOT_TOKEN and OWNER_ID must be set in .env file.")
+    sys.exit(1)
+
 try:
-    import docker
-    DOCKER_AVAILABLE = Config.USE_DOCKER and docker.from_env().ping()
-except:
-    DOCKER_AVAILABLE = False
-    logger.info("Docker not available. Using subprocess with resource limits.")
+    OWNER_ID = int(OWNER_ID)
+except ValueError:
+    logging.error("OWNER_ID must be an integer (Telegram user ID).")
+    sys.exit(1)
 
-class BotRunner:
-    @staticmethod
-    def run(user_id, bot_id, filename, bot_name, auto_restart=False):
-        file_path = project_path / filename
-        if not file_path.exists():
-            raise FileNotFoundError(f"File {filename} not found")
-        
-        with get_db() as conn:
-            c = conn.cursor()
-            count = c.execute("SELECT COUNT(*) FROM deployments WHERE user_id=? AND status='Running'", (user_id,)).fetchone()[0]
-            if count >= Config.MAX_PROCESSES:
-                raise Exception(f"Maximum running bots limit reached ({Config.MAX_PROCESSES})")
-        
-        if DOCKER_AVAILABLE:
-            return BotRunner._run_docker(user_id, bot_id, file_path, bot_name, auto_restart)
+# Database per instance
+DB_FILE = f"instance_{INSTANCE_ID}.db"
+
+# Flask secret key (generate random, used for sessions)
+FLASK_SECRET = uuid.uuid4().hex
+
+# ==================== LOGGING ====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("VotingBoard")
+
+# ==================== PORT AVAILABILITY CHECK ====================
+
+def is_port_available(port):
+    """Return True if the given TCP port is free."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except socket.error:
+            return False
+
+if not is_port_available(PORT):
+    logger.error(f"Port {PORT} is already in use. Please choose another port in .env")
+    sys.exit(1)
+
+# ==================== DATABASE LAYER ====================
+# Simple, synchronous SQLite. One connection per thread (bot + Flask).
+
+def get_db_connection():
+    """Return a new SQLite connection for the current thread."""
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_database():
+    """Create tables if they don't exist."""
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS polls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                poll_id TEXT UNIQUE NOT NULL,
+                question TEXT NOT NULL,
+                options TEXT NOT NULL,          -- JSON array of strings
+                created_at INTEGER NOT NULL,    -- Unix timestamp
+                close_at INTEGER,              -- optional Unix timestamp
+                is_active BOOLEAN NOT NULL DEFAULT 1,
+                anonymous BOOLEAN NOT NULL DEFAULT 1,
+                allow_vote_change BOOLEAN NOT NULL DEFAULT 0,
+                created_by INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                poll_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                option_index INTEGER NOT NULL,
+                voted_at INTEGER NOT NULL,
+                FOREIGN KEY(poll_id) REFERENCES polls(poll_id) ON DELETE CASCADE,
+                UNIQUE(poll_id, user_id)       -- one vote per user per poll
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                first_name TEXT,
+                username TEXT,
+                last_interaction INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                user_id INTEGER,
+                details TEXT
+            )
+        """)
+        conn.commit()
+    logger.info(f"Database initialized: {DB_FILE}")
+
+# -------------------- Poll operations --------------------
+def create_poll(poll_id, question, options, close_at, anonymous, allow_vote_change, created_by):
+    """Insert a new poll into the database."""
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO polls (poll_id, question, options, created_at, close_at, anonymous, allow_vote_change, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (poll_id, question, json.dumps(options), int(datetime.now().timestamp()), close_at, anonymous, allow_vote_change, created_by)
+        )
+        conn.commit()
+
+def get_poll(poll_id):
+    """Return a poll as dict, or None."""
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM polls WHERE poll_id = ?", (poll_id,)).fetchone()
+    return dict(row) if row else None
+
+def get_all_polls(active_only=True):
+    """Return list of polls, optionally only active ones."""
+    with get_db_connection() as conn:
+        if active_only:
+            rows = conn.execute("SELECT * FROM polls WHERE is_active = 1 AND (close_at IS NULL OR close_at > ?) ORDER BY created_at DESC", (int(datetime.now().timestamp()),)).fetchall()
         else:
-            return BotRunner._run_subprocess(user_id, bot_id, file_path, bot_name, auto_restart)
-    
-    @staticmethod
-    def _run_subprocess(user_id, bot_id, file_path, bot_name, auto_restart):
-        try:
-            if hasattr(resource, 'RLIMIT_CPU') and hasattr(resource, 'RLIMIT_AS'):
-                try:
-                    resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
-                    mem_limit = Config.MAX_RAM_MB * 1024 * 1024
-                    resource.setrlimit(resource.RLIMIT_AS, (mem_limit, -1))
-                except Exception as e:
-                    logger.warning(f"Resource limit set failed: {e}")
-            
-            proc = subprocess.Popen(
-                ['python', str(file_path)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid
-            )
-            logger.info(f"Bot {bot_name} (PID: {proc.pid}) started for user {user_id}")
-            return {
-                'pid': proc.pid,
-                'container_id': None,
-                'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'status': 'Running'
-            }
-        except Exception as e:
-            logger.exception(f"Subprocess run failed: {e}")
-            raise
-    
-    @staticmethod
-    def _run_docker(user_id, bot_id, file_path, bot_name, auto_restart):
-        client = docker.from_env()
-        container_name = f"bot_{user_id}_{bot_id}_{uuid.uuid4().hex[:8]}"
-        try:
-            container = client.containers.run(
-                image=Config.DOCKER_IMAGE,
-                command=f"python /app/{file_path.name}",
-                volumes={str(file_path.parent): {'bind': '/app', 'mode': 'ro'}},
-                name=container_name,
-                detach=True,
-                mem_limit=f"{Config.MAX_RAM_MB}m",
-                cpu_period=100000,
-                cpu_quota=int(Config.MAX_CPU_PERCENT * 1000),
-                network_disabled=False,
-                remove=True
-            )
-            logger.info(f"Bot {bot_name} (Container: {container.id}) started for user {user_id}")
-            return {
-                'pid': None,
-                'container_id': container.id,
-                'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'status': 'Running'
-            }
-        except Exception as e:
-            logger.exception(f"Docker run failed: {e}")
-            raise
-    
-    @staticmethod
-    def stop(pid, container_id):
-        if container_id and DOCKER_AVAILABLE:
-            try:
-                client = docker.from_env()
-                container = client.containers.get(container_id)
-                container.stop(timeout=5)
-                logger.info(f"Container {container_id} stopped")
-                return True
-            except Exception as e:
-                logger.error(f"Stop container {container_id} error: {e}")
-                return False
-        elif pid:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
-                logger.info(f"Process {pid} killed")
-                return True
-            except:
-                pass
-        return False
+            rows = conn.execute("SELECT * FROM polls ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
 
-# ==================== ইউজার বট সুপারভাইজার ====================
-class BotSupervisor(threading.Thread):
-    def __init__(self, interval=30):
-        super().__init__()
-        self.interval = interval
-        self.daemon = True
-    
-    def run(self):
-        while True:
-            try:
-                self._check_bots()
-            except Exception as e:
-                logger.exception(f"Supervisor error: {e}")
-            time.sleep(self.interval)
-    
-    def _check_bots(self):
-        with get_db() as conn:
-            c = conn.cursor()
-            running_bots = c.execute(
-                "SELECT id, user_id, filename, pid, container_id, auto_restart FROM deployments WHERE status='Running'"
-            ).fetchall()
-            for bot in running_bots:
-                bot_id, user_id, filename, pid, container_id, auto_restart = bot
-                if container_id and DOCKER_AVAILABLE:
-                    running = self._check_docker(container_id)
-                else:
-                    stat = get_process_stats(pid)
-                    running = stat and stat['running'] if stat else False
-                
-                if not running:
-                    c.execute("UPDATE deployments SET status='Crashed' WHERE id=?", (bot_id,))
-                    if auto_restart:
-                        logger.info(f"Auto-restarting bot {bot_id} for user {user_id}")
-                        self._restart_bot(bot_id, user_id, filename)
-            conn.commit()
-    
-    def _check_docker(self, container_id):
-        try:
-            client = docker.from_env()
-            container = client.containers.get(container_id)
-            return container.status == 'running'
-        except:
-            return False
-    
-    def _restart_bot(self, bot_id, user_id, filename):
-        with get_db() as conn:
-            c = conn.cursor()
-            bot_info = c.execute("SELECT bot_name, auto_restart FROM deployments WHERE id=?", (bot_id,)).fetchone()
-            if bot_info:
-                bot_name = bot_info[0]
-                auto_restart = bot_info[1]
-                try:
-                    runner = BotRunner.run(user_id, bot_id, filename, bot_name, auto_restart)
-                    if runner:
-                        c.execute("UPDATE deployments SET pid=?, container_id=?, start_time=?, status=? WHERE id=?",
-                                  (runner.get('pid'), runner.get('container_id'), runner['start_time'], 'Running', bot_id))
-                        conn.commit()
-                        logger.info(f"Bot {bot_id} restarted successfully.")
-                except Exception as e:
-                    logger.error(f"Restart failed for bot {bot_id}: {e}")
+def update_poll_status(poll_id, active):
+    """Activate or deactivate a poll."""
+    with get_db_connection() as conn:
+        conn.execute("UPDATE polls SET is_active = ? WHERE poll_id = ?", (1 if active else 0, poll_id))
+        conn.commit()
 
-BotSupervisor().start()
-logger.info("Bot supervisor thread started.")
+def delete_poll(poll_id):
+    """Remove a poll and all its votes (cascade)."""
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM polls WHERE poll_id = ?", (poll_id,))
+        conn.commit()
 
-# ==================== ইউটিলিটি ফাংশন ====================
-def get_user(user_id):
-    with get_db() as conn:
-        c = conn.cursor()
-        user = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-    return user
+def reset_votes(poll_id):
+    """Delete all votes for a given poll."""
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM votes WHERE poll_id = ?", (poll_id,))
+        conn.commit()
 
-def is_prime(user_id):
-    user = get_user(user_id)
-    if user and user['expiry']:
-        try:
-            expiry = datetime.strptime(user['expiry'], '%Y-%m-%d %H:%M:%S')
-            return expiry > datetime.now()
-        except:
-            return False
-    return False
+# -------------------- Vote operations --------------------
+def add_vote(poll_id, user_id, option_index):
+    """Record a vote. If vote exists and change is allowed, update it."""
+    with get_db_connection() as conn:
+        poll = conn.execute("SELECT allow_vote_change FROM polls WHERE poll_id = ?", (poll_id,)).fetchone()
+        if not poll:
+            return False, "Poll not found."
+        allow_change = poll["allow_vote_change"]
+        existing = conn.execute("SELECT id FROM votes WHERE poll_id = ? AND user_id = ?", (poll_id, user_id)).fetchone()
+        if existing:
+            if not allow_change:
+                return False, "You have already voted and vote change is not allowed."
+            conn.execute("UPDATE votes SET option_index = ?, voted_at = ? WHERE poll_id = ? AND user_id = ?",
+                         (option_index, int(datetime.now().timestamp()), poll_id, user_id))
+        else:
+            conn.execute("INSERT INTO votes (poll_id, user_id, option_index, voted_at) VALUES (?, ?, ?, ?)",
+                         (poll_id, user_id, option_index, int(datetime.now().timestamp())))
+        conn.commit()
+    return True, "Vote recorded."
 
-def get_user_bots(user_id):
-    with get_db() as conn:
-        c = conn.cursor()
-        bots = c.execute(
-            "SELECT id, bot_name, filename, pid, start_time, status FROM deployments WHERE user_id=?",
-            (user_id,)
+def get_user_vote(poll_id, user_id):
+    """Return the option index voted by user, or None."""
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT option_index FROM votes WHERE poll_id = ? AND user_id = ?", (poll_id, user_id)).fetchone()
+    return row["option_index"] if row else None
+
+def get_vote_counts(poll_id):
+    """Return a dict: {option_index: count} and total votes."""
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT option_index, COUNT(*) as cnt FROM votes WHERE poll_id = ? GROUP BY option_index", (poll_id,)).fetchall()
+    counts = {r["option_index"]: r["cnt"] for r in rows}
+    total = sum(counts.values())
+    return counts, total
+
+def get_all_votes_with_timestamps(poll_id):
+    """Return list of votes with user info and timestamp (for owner)."""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT user_id, option_index, voted_at FROM votes WHERE poll_id = ? ORDER BY voted_at DESC",
+            (poll_id,)
         ).fetchall()
-    return bots
+    return [dict(r) for r in rows]
 
-def update_bot_stats(bot_id, cpu, ram):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE deployments SET cpu_usage=?, ram_usage=? WHERE id=?", (cpu, ram, bot_id))
+# -------------------- User operations --------------------
+def update_user_info(user_id, first_name, username):
+    """Store or update user information."""
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, first_name, username, last_interaction) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name, username=excluded.username, last_interaction=excluded.last_interaction",
+            (user_id, first_name, username, int(datetime.now().timestamp()))
+        )
         conn.commit()
 
-def generate_random_key():
-    prefix = "PRIME-"
-    random_chars = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=8))
-    return f"{prefix}{random_chars}"
+def get_active_users_count(since_hours=24):
+    """Number of distinct users who interacted in the last N hours."""
+    cutoff = int(datetime.now().timestamp()) - (since_hours * 3600)
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM users WHERE last_interaction > ?", (cutoff,)).fetchone()
+    return row["cnt"] if row else 0
 
-def create_progress_bar(percentage):
-    bars = int(percentage / 10)
-    return "█" * bars + "░" * (10 - bars)
-
-def safe_edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode=None):
-    try:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-        return message_id
-    except Exception as e:
-        logger.warning(f"Edit message failed: {e}. Sending new message.")
-        msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-        return msg.message_id
-
-# ==================== কীবোর্ড মেনু (Prime) ====================
-def main_menu(user_id):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    user = get_user(user_id)
-    if not is_prime(user_id):
-        markup.add(types.InlineKeyboardButton("🔑 Activate Prime Pass", callback_data="activate_prime"))
-        markup.add(types.InlineKeyboardButton("ℹ️ Prime Features", callback_data="prime_info"))
-    else:
-        markup.add(
-            types.InlineKeyboardButton("📤 Upload Bot File", callback_data='upload'),
-            types.InlineKeyboardButton("🤖 My Bots", callback_data='my_bots')
+# -------------------- Logging --------------------
+def log_action(action, user_id=None, details=None):
+    """Insert an entry into the logs table."""
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO logs (timestamp, action, user_id, details) VALUES (?, ?, ?, ?)",
+            (int(datetime.now().timestamp()), action, user_id, details)
         )
-        markup.add(
-            types.InlineKeyboardButton("🚀 Deploy New Bot", callback_data='deploy_new'),
-            types.InlineKeyboardButton("📊 Dashboard", callback_data='dashboard')
-        )
-    markup.add(types.InlineKeyboardButton("⚙️ Settings", callback_data='settings'))
-    if user_id == Config.ADMIN_ID:
-        markup.add(types.InlineKeyboardButton("👑 Admin Panel", callback_data='admin_panel'))
+        conn.commit()
+
+# ==================== SECURITY HELPERS ====================
+
+def is_owner(user_id):
+    """Check if the Telegram user is the configured owner."""
+    return user_id == OWNER_ID
+
+def verify_admin_credentials(core_key, instance_secret):
+    """Verify credentials for web admin access."""
+    return core_key == CORE_KEY and instance_secret == INSTANCE_SECRET
+
+# ==================== TELEGRAM BOT ====================
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)  # no async
+
+# Temporary storage for poll creation (per user)
+poll_creation_data = {}
+
+# -------------------- Keyboards --------------------
+def user_main_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("🗳 Vote Now"), KeyboardButton("📊 Live Polls"))
+    markup.add(KeyboardButton("📈 Results"), KeyboardButton("ℹ️ Poll Info"))
     return markup
 
-def admin_menu():
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("🎫 Generate Key", callback_data="gen_key"),
-        types.InlineKeyboardButton("👥 All Users", callback_data="all_users")
-    )
-    markup.add(
-        types.InlineKeyboardButton("🤖 All Bots", callback_data="all_bots"),
-        types.InlineKeyboardButton("📈 Statistics", callback_data="stats")
-    )
-    markup.add(
-        types.InlineKeyboardButton("⚙️ Maintenance", callback_data="maintenance"),
-        types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")
-    )
+def owner_main_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("➕ Create Poll"), KeyboardButton("⚙️ Manage Polls"))
+    markup.add(KeyboardButton("🗑 Delete Poll"), KeyboardButton("🔄 Reset Votes"))
+    markup.add(KeyboardButton("📤 Export Data"), KeyboardButton("📟 System Info"))
+    markup.add(KeyboardButton("🛑 Shutdown"))
     return markup
 
-# ==================== কমান্ড হ্যান্ডলার ====================
+def poll_list_keyboard(polls, action_prefix):
+    """Generate inline keyboard with poll buttons."""
+    markup = InlineKeyboardMarkup()
+    for p in polls:
+        markup.add(InlineKeyboardButton(p["question"][:30], callback_data=f"{action_prefix}:{p['poll_id']}"))
+    return markup
+
+# -------------------- Handlers --------------------
 @bot.message_handler(commands=['start'])
-@rate_limit
-def welcome(message):
-    uid = message.from_user.id
-    username = message.from_user.username or "User"
-    
-    if Config.MAINTENANCE and uid != Config.ADMIN_ID:
-        bot.send_message(message.chat.id, "🛠 **System Maintenance**\n\nWe're currently upgrading our servers. Please try again later.")
+def cmd_start(message):
+    user_id = message.from_user.id
+    update_user_info(user_id, message.from_user.first_name, message.from_user.username)
+    bot.send_message(message.chat.id,
+                     f"Welcome to the Voting Board (Instance: {INSTANCE_ID[:8]}).\n"
+                     "Use the buttons below to navigate.",
+                     reply_markup=owner_main_keyboard() if is_owner(user_id) else user_main_keyboard())
+    log_action("/start", user_id)
+
+# ----- User actions -----
+@bot.message_handler(func=lambda m: m.text == "🗳 Vote Now")
+def vote_now(message):
+    user_id = message.from_user.id
+    polls = get_all_polls(active_only=True)
+    if not polls:
+        bot.reply_to(message, "No active polls at the moment.")
         return
-    
-    user = get_user(uid)
-    if not user:
-        with get_db() as conn:
-            c = conn.cursor()
-            join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            c.execute("INSERT OR IGNORE INTO users (id, username, expiry, file_limit, is_prime, join_date) VALUES (?, ?, ?, ?, ?, ?)",
-                      (uid, username, None, 0, 0, join_date))
-            conn.commit()
-        user = get_user(uid)
-    
-    if not user:
-        bot.send_message(message.chat.id, "❌ Error loading user data. Please try again.")
+    markup = InlineKeyboardMarkup()
+    for p in polls:
+        # check if user already voted
+        voted = get_user_vote(p["poll_id"], user_id)
+        status = "✅" if voted else "⭕"
+        markup.add(InlineKeyboardButton(f"{status} {p['question'][:30]}", callback_data=f"vote:{p['poll_id']}"))
+    bot.send_message(message.chat.id, "Select a poll to vote:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text == "📊 Live Polls")
+def live_polls(message):
+    """Show all active polls with live counts (public)."""
+    polls = get_all_polls(active_only=True)
+    if not polls:
+        bot.reply_to(message, "No active polls.")
         return
-    
-    status = "PRIME 👑" if is_prime(uid) else "FREE 🆓"
-    expiry = user['expiry'] if user['expiry'] else "Not Activated"
-    
-    text = f"""
-🤖 **UNIQUE HOST BD v1.2.0**
-DEV: TEAMZQ © COPYRIGHT ❌ 
-HOST: Asia 🌏 | data: orange 🍊 
-━━━━━━━━━━━━━━━━━━━━━━━━
-👤 **User:** @{username}
-🆔 **ID:** `{uid}`
-💎 **Status:** {status}
-📅 **Join Date:** {user['join_date']}
-━━━━━━━━━━━━━━━━━━━━━━━━
-📊 **Account Details:**
-• Plan: {'PRIME' if is_prime(uid) else 'Free'}
-• File Limit: `{user['file_limit']}` files
-• Expiry: {expiry}
-━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    
-    bot.send_message(message.chat.id, text, reply_markup=main_menu(uid), parse_mode="Markdown")
-    logger.info(f"User {uid} started bot.")
+    text = "📊 **Live Polls**\n\n"
+    for p in polls:
+        counts, total = get_vote_counts(p["poll_id"])
+        text += f"**{p['question']}**\n"
+        options = json.loads(p["options"])
+        for idx, opt in enumerate(options):
+            count = counts.get(idx, 0)
+            text += f"• {opt}: {count} votes\n"
+        text += f"Total: {total} vote(s)\n"
+        if p["close_at"]:
+            close_time = datetime.fromtimestamp(p["close_at"]).strftime("%Y-%m-%d %H:%M")
+            text += f"Closes: {close_time}\n"
+        text += "\n"
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-@bot.message_handler(commands=['admin'])
-@rate_limit
-def admin_command(message):
-    uid = message.from_user.id
-    if uid == Config.ADMIN_ID:
-        admin_panel(message)
-    else:
-        bot.reply_to(message, "⛔ **Access Denied!**\nYou are not authorized to use this command.")
+@bot.message_handler(func=lambda m: m.text == "📈 Results")
+def results(message):
+    """Show closed polls results or any poll final results."""
+    polls = get_all_polls(active_only=False)
+    if not polls:
+        bot.reply_to(message, "No polls available.")
+        return
+    markup = poll_list_keyboard(polls, "results")
+    bot.send_message(message.chat.id, "Select a poll to see results:", reply_markup=markup)
 
-def admin_panel(message):
-    text = """
-👑 **ADMIN CONTROL PANEL**
-━━━━━━━━━━━━━━━━━━━━
-Welcome to the admin dashboard. You can manage users, generate keys, and monitor system activities.
-━━━━━━━━━━━━━━━━━━━━
-"""
-    bot.send_message(message.chat.id, text, reply_markup=admin_menu(), parse_mode="Markdown")
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Poll Info")
+def poll_info(message):
+    polls = get_all_polls(active_only=False)
+    if not polls:
+        bot.reply_to(message, "No polls.")
+        return
+    markup = poll_list_keyboard(polls, "info")
+    bot.send_message(message.chat.id, "Select a poll for details:", reply_markup=markup)
 
-# ==================== কলব্যাক হ্যান্ডলার ====================
+# ----- Owner actions -----
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "➕ Create Poll")
+def create_poll_start(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    poll_creation_data[user_id] = {}
+    bot.send_message(chat_id, "Enter the poll question:")
+    bot.register_next_step_handler(message, process_poll_question)
+
+def process_poll_question(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    if user_id not in poll_creation_data:
+        return
+    poll_creation_data[user_id]['question'] = message.text
+    bot.send_message(chat_id, "Enter poll options, one per line:\nExample:\nYes\nNo\nMaybe")
+    bot.register_next_step_handler(message, process_poll_options)
+
+def process_poll_options(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    if user_id not in poll_creation_data:
+        return
+    options = [line.strip() for line in message.text.split('\n') if line.strip()]
+    if len(options) < 2:
+        bot.send_message(chat_id, "At least two options required. Try again.")
+        bot.register_next_step_handler(message, process_poll_options)
+        return
+    poll_creation_data[user_id]['options'] = options
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Skip (no close time)", callback_data="close:skip"))
+    bot.send_message(chat_id, "Enter close time in format YYYY-MM-DD HH:MM (24h) or skip:", reply_markup=markup)
+    bot.register_next_step_handler(message, process_poll_close)
+
+def process_poll_close(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    if user_id not in poll_creation_data:
+        return
+    text = message.text.strip()
+    close_ts = None
+    if text.lower() != "skip":
+        try:
+            dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
+            close_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            bot.send_message(chat_id, "Invalid format. Use YYYY-MM-DD HH:MM or Skip.")
+            bot.register_next_step_handler(message, process_poll_close)
+            return
+    poll_creation_data[user_id]['close_at'] = close_ts
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Anonymous", callback_data="anon:1"),
+               InlineKeyboardButton("Public", callback_data="anon:0"))
+    bot.send_message(chat_id, "Vote anonymity?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("anon:"))
+def set_anon(call):
+    user_id = call.from_user.id
+    if user_id not in poll_creation_data:
+        bot.answer_callback_query(call.id, "Session expired.")
+        return
+    anon = int(call.data.split(":")[1]) == 1
+    poll_creation_data[user_id]['anonymous'] = anon
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Yes", callback_data="change:1"),
+               InlineKeyboardButton("No", callback_data="change:0"))
+    bot.edit_message_text("Allow users to change their vote?", call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("change:"))
+def set_change(call):
+    user_id = call.from_user.id
+    if user_id not in poll_creation_data:
+        bot.answer_callback_query(call.id, "Session expired.")
+        return
+    allow_change = int(call.data.split(":")[1]) == 1
+    poll_creation_data[user_id]['allow_vote_change'] = allow_change
+    # generate unique poll id
+    poll_id = str(uuid.uuid4())[:8]
+    data = poll_creation_data.pop(user_id)
+    create_poll(
+        poll_id=poll_id,
+        question=data['question'],
+        options=data['options'],
+        close_at=data.get('close_at'),
+        anonymous=data.get('anonymous', True),
+        allow_vote_change=allow_change,
+        created_by=user_id
+    )
+    log_action("create_poll", user_id, f"poll_id={poll_id}")
+    bot.edit_message_text(f"✅ Poll created successfully!\nPoll ID: `{poll_id}`\nShare this ID for voting via board.",
+                          call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "⚙️ Manage Polls")
+def manage_polls(message):
+    polls = get_all_polls(active_only=False)
+    if not polls:
+        bot.reply_to(message, "No polls.")
+        return
+    markup = poll_list_keyboard(polls, "manage")
+    bot.send_message(message.chat.id, "Select a poll to manage:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🗑 Delete Poll")
+def delete_poll_prompt(message):
+    polls = get_all_polls(active_only=False)
+    if not polls:
+        bot.reply_to(message, "No polls.")
+        return
+    markup = poll_list_keyboard(polls, "delete")
+    bot.send_message(message.chat.id, "Select poll to DELETE:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🔄 Reset Votes")
+def reset_votes_prompt(message):
+    polls = get_all_polls(active_only=False)
+    if not polls:
+        bot.reply_to(message, "No polls.")
+        return
+    markup = poll_list_keyboard(polls, "reset")
+    bot.send_message(message.chat.id, "Select poll to reset votes:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "📤 Export Data")
+def export_data(message):
+    """Send the SQLite database file to the owner."""
+    try:
+        with open(DB_FILE, 'rb') as f:
+            bot.send_document(message.chat.id, f, caption=f"Instance {INSTANCE_ID} database export.")
+        log_action("export_db", message.from_user.id)
+    except Exception as e:
+        bot.reply_to(message, f"Export failed: {e}")
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "📟 System Info")
+def system_info(message):
+    """Show instance info, active users, resource usage."""
+    info = f"🖥 **Instance Info**\n"
+    info += f"ID: `{INSTANCE_ID}`\n"
+    info += f"Secret: `{INSTANCE_SECRET[:8]}...`\n"
+    info += f"Port: {PORT}\n"
+    info += f"DB: {DB_FILE}\n\n"
+    info += f"📊 **Statistics**\n"
+    with get_db_connection() as conn:
+        total_polls = conn.execute("SELECT COUNT(*) FROM polls").fetchone()[0]
+        total_votes = conn.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
+        total_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users").fetchone()[0]
+    info += f"Total polls: {total_polls}\n"
+    info += f"Total votes: {total_votes}\n"
+    info += f"Total users: {total_users}\n"
+    info += f"Active users (24h): {get_active_users_count()}\n"
+    if PSUTIL_AVAILABLE:
+        info += f"\n🖥 **System**\n"
+        info += f"CPU: {psutil.cpu_percent()}%\n"
+        info += f"RAM: {psutil.virtual_memory().percent}%\n"
+    bot.send_message(message.chat.id, info, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🛑 Shutdown")
+def shutdown(message):
+    bot.reply_to(message, "Shutting down bot and web server...")
+    log_action("shutdown", message.from_user.id)
+    # Force exit after a short delay
+    threading.Timer(2.0, lambda: os._exit(0)).start()
+    bot.stop_polling()
+
+# ----- Inline callback handlers -----
 @bot.callback_query_handler(func=lambda call: True)
-@rate_limit_callback
-def callback_manager(call):
-    uid = call.from_user.id
-    mid = call.message.message_id
+def handle_inline(call):
+    user_id = call.from_user.id
+    data = call.data
     chat_id = call.message.chat.id
-    
-    try:
-        if call.data == "activate_prime":
-            msg = safe_edit_message_text(chat_id, mid, """
-🔑 **ACTIVATE PRIME PASS**
-━━━━━━━━━━━━━━━━━━━━
-Enter your activation key below.
-Format: `PRIME-XXXXXX`
-━━━━━━━━━━━━━━━━━━━━
-            """, parse_mode="Markdown")
-            bot.register_next_step_handler_by_chat_id(chat_id, process_key_step, msg)
-            
-        elif call.data == "upload":
-            if not is_prime(uid):
-                bot.answer_callback_query(call.id, "⚠️ Prime feature! Activate Prime first.")
-                return
-            msg = safe_edit_message_text(chat_id, mid, """
-📤 **UPLOAD BOT FILE**
-━━━━━━━━━━━━━━━━━━━━
-Please send your Python (.py) bot file.
-• Max size: 5MB
-• Must be .py extension
-━━━━━━━━━━━━━━━━━━━━
-            """, parse_mode="Markdown")
-            bot.register_next_step_handler_by_chat_id(chat_id, upload_file_step, msg)
-            
-        elif call.data == "deploy_new":
-            if not is_prime(uid):
-                bot.answer_callback_query(call.id, "⚠️ Prime feature!")
-                return
-            show_available_files(call)
-            
-        elif call.data == "my_bots":
-            show_my_bots(call)
-            
-        elif call.data == "dashboard":
-            show_dashboard(call)
-            
-        elif call.data == "admin_panel":
-            if uid == Config.ADMIN_ID:
-                admin_panel_callback(call)
-            else:
-                bot.answer_callback_query(call.id, "⛔ Access Denied!")
-                
-        elif call.data == "gen_key":
-            if uid == Config.ADMIN_ID:
-                gen_key_step1(call)
-            else:
-                bot.answer_callback_query(call.id, "⛔ Admin only!")
-                
-        elif call.data == "all_users":
-            if uid == Config.ADMIN_ID:
-                show_all_users(call)
-                
-        elif call.data == "all_bots":
-            if uid == Config.ADMIN_ID:
-                show_all_bots_admin(call)
-                
-        elif call.data == "stats":
-            if uid == Config.ADMIN_ID:
-                show_admin_stats(call)
-                
-        elif call.data.startswith("bot_"):
-            bot_id = call.data.split("_")[1]
-            show_bot_details(call, bot_id)
-            
-        elif call.data.startswith("deploy_"):
-            filename = call.data.split("_")[1]
-            start_deployment(call, filename)
-            
-        elif call.data.startswith("stop_"):
-            bot_id = call.data.split("_")[1]
-            stop_bot(call, bot_id)
-            
-        elif call.data.startswith("start_"):
-            bot_id = call.data.split("_")[1]
-            start_stopped_bot(call, bot_id)
-            
-        elif call.data == "install_libs":
-            ask_for_libraries(call)
-            
-        elif call.data == "back_main":
-            safe_edit_message_text(chat_id, mid, "🏠 **Main Menu**", reply_markup=main_menu(uid), parse_mode="Markdown")
-            
-        elif call.data == "prime_info":
-            show_prime_info(call)
-            
-        elif call.data == "settings":
-            show_settings(call)
-            
-        elif call.data == "maintenance":
-            toggle_maintenance(call)
-            
-        elif call.data == "notif_settings":
-            bot.answer_callback_query(call.id, "🔔 Notification settings coming soon!")
-            
-        elif call.data == "lang_settings":
-            bot.answer_callback_query(call.id, "🌐 Language settings coming soon!")
-            
-    except Exception as e:
-        logger.exception(f"Callback error: {call.data}")
-        bot.answer_callback_query(call.id, "⚠️ Error occurred!")
+    msg_id = call.message.message_id
 
-# ==================== স্টেপ-বাই-স্টেপ ফাংশন ====================
-def gen_key_step1(call):
-    msg = safe_edit_message_text(call.message.chat.id, call.message.message_id, """
-🎫 **GENERATE PRIME KEY**
-━━━━━━━━━━━━━━━━━━━━
-Step 1/3: Enter duration in days
-Example: 7, 30, 90, 365
-━━━━━━━━━━━━━━━━━━━━
-    """, parse_mode="Markdown")
-    bot.register_next_step_handler_by_chat_id(call.message.chat.id, gen_key_step2, msg)
-
-def gen_key_step2(message, old_mid):
-    try:
-        days = int(message.text.strip())
-        if days <= 0:
-            raise ValueError
-        bot.delete_message(message.chat.id, message.message_id)
-        msg = bot.send_message(message.chat.id, f"""
-🎫 **GENERATE PRIME KEY**
-━━━━━━━━━━━━━━━━━━━━
-Step 2/3: Duration set to **{days} days**
-
-Now enter file access limit
-Example: 3, 5, 10
-━━━━━━━━━━━━━━━━━━━━
-        """, parse_mode="Markdown")
-        bot.register_next_step_handler(msg, gen_key_step3, days)
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid input! Please enter a valid number.")
-
-def gen_key_step3(message, days):
-    try:
-        limit = int(message.text.strip())
-        if limit <= 0:
-            raise ValueError
-        bot.delete_message(message.chat.id, message.message_id)
-        
-        key = generate_random_key()
-        created_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("INSERT INTO keys VALUES (?, ?, ?, ?)", (key, days, limit, created_date))
-            conn.commit()
-        
-        response = f"""
-✅ **KEY GENERATED SUCCESSFULLY**
-━━━━━━━━━━━━━━━━━━━━
-🔑 **Key:** `{key}`
-⏰ **Duration:** {days} days
-📦 **File Limit:** {limit} files
-📅 **Created:** {created_date}
-━━━━━━━━━━━━━━━━━━━━
-Share this key with the user.
-        """
-        bot.send_message(message.chat.id, response, parse_mode="Markdown")
-        logger.info(f"Admin generated key: {key}")
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid input!")
-
-def upload_file_step(message, old_mid):
-    uid = message.from_user.id
-    chat_id = message.chat.id
-    
-    if not is_prime(uid):
-        safe_edit_message_text(chat_id, old_mid, "⚠️ **Prime Required**\n\nActivate Prime to upload files.", reply_markup=main_menu(uid), parse_mode="Markdown")
-        return
-    
-    if message.content_type == 'document' and message.document.file_name.endswith('.py'):
-        if message.document.file_size > Config.MAX_FILE_SIZE_MB * 1024 * 1024:
-            bot.reply_to(message, f"❌ File too large! Max {Config.MAX_FILE_SIZE_MB}MB.")
+    if data.startswith("vote:"):
+        poll_id = data.split(":")[1]
+        poll = get_poll(poll_id)
+        if not poll or not poll["is_active"]:
+            bot.answer_callback_query(call.id, "Poll is not active.", show_alert=True)
             return
-        
-        try:
-            safe_edit_message_text(chat_id, old_mid, "📥 **Downloading file...**", parse_mode="Markdown")
-            
-            file_info = bot.get_file(message.document.file_id)
-            downloaded = bot.download_file(file_info.file_path)
-            original_name = message.document.file_name
-            safe_name = secure_filename(original_name)
-            
-            file_path = project_path / safe_name
-            file_path.write_bytes(downloaded)
-            
-            bot.delete_message(chat_id, message.message_id)
-            msg = bot.send_message(chat_id, """
-🤖 **BOT NAME SETUP**
-━━━━━━━━━━━━━━━━━━━━
-Enter a name for your bot
-Example: `News Bot`, `Music Bot`, `Assistant`
-━━━━━━━━━━━━━━━━━━━━
-            """, parse_mode="Markdown")
-            bot.register_next_step_handler(msg, save_bot_name, safe_name, original_name)
-            
-        except Exception as e:
-            logger.exception(f"File upload failed for user {uid}")
-            safe_edit_message_text(chat_id, old_mid, f"❌ **Error:** {str(e)}", parse_mode="Markdown")
-    else:
-        safe_edit_message_text(chat_id, old_mid, "❌ **Invalid File!**\n\nOnly Python (.py) files allowed.", parse_mode="Markdown")
+        options = json.loads(poll["options"])
+        markup = InlineKeyboardMarkup()
+        for idx, opt in enumerate(options):
+            markup.add(InlineKeyboardButton(opt, callback_data=f"select:{poll_id}:{idx}"))
+        bot.edit_message_text(f"🗳 {poll['question']}\nChoose your option:", chat_id, msg_id, reply_markup=markup)
 
-def save_bot_name(message, safe_name, original_name):
-    uid = message.from_user.id
-    chat_id = message.chat.id
-    bot_name = message.text.strip()
-    
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO deployments (user_id, bot_name, filename, pid, start_time, status) VALUES (?, ?, ?, ?, ?, ?)",
-                  (uid, bot_name, safe_name, 0, None, "Uploaded"))
-        conn.commit()
-    
-    bot.delete_message(chat_id, message.message_id)
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("📚 Install Libraries", callback_data="install_libs"))
-    markup.add(types.InlineKeyboardButton("🤖 My Bots", callback_data="my_bots"))
-    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-    
-    text = f"""
-✅ **FILE UPLOADED SUCCESSFULLY**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot Name:** {bot_name}
-📁 **File:** `{original_name}`
-📊 **Status:** Ready for setup
-━━━━━━━━━━━━━━━━━━━━
-Click 'Install Libraries' to add dependencies.
-    """
-    
-    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
-    logger.info(f"User {uid} uploaded file {safe_name}")
-
-# ==================== প্যাকেজ ইনস্টলেশন ====================
-ALLOWED_PIP_PACKAGES = {'pyTelegramBotAPI', 'requests', 'beautifulsoup4', 'flask', 'django', 'numpy', 'pandas', 'pillow', 'matplotlib'}
-
-def validate_pip_command(cmd):
-    cmd = cmd.strip()
-    if not cmd.startswith('pip install'):
-        return False
-    parts = cmd.split()
-    if len(parts) < 3:
-        return False
-    package = parts[2].split('==')[0].split('>')[0].split('<')[0].split('[')[0]
-    if package not in ALLOWED_PIP_PACKAGES:
-        logger.warning(f"Blocked pip install attempt: {package}")
-        return False
-    return True
-
-def ask_for_libraries(call):
-    msg = safe_edit_message_text(call.message.chat.id, call.message.message_id, """
-📚 **INSTALL LIBRARIES**
-━━━━━━━━━━━━━━━━━━━━
-Enter library commands (one per line):
-Example:
-```
-
-pip install pyTelegramBotAPI
-pip install requests
-pip install beautifulsoup4
-
-```
-━━━━━━━━━━━━━━━━━━━━
-    """, parse_mode="Markdown")
-    bot.register_next_step_handler_by_chat_id(call.message.chat.id, install_libraries_step, msg)
-
-def install_libraries_step(message, old_mid):
-    uid = message.from_user.id
-    chat_id = message.chat.id
-    commands = message.text.strip().split('\n')
-    
-    bot.delete_message(chat_id, message.message_id)
-    
-    safe_edit_message_text(chat_id, old_mid, """
-🛠 **INSTALLING LIBRARIES**
-━━━━━━━━━━━━━━━━━━━━
-Starting installation...
-━━━━━━━━━━━━━━━━━━━━
-    """, parse_mode="Markdown")
-    
-    results = []
-    for i, cmd in enumerate(commands):
-        if cmd.strip() and "pip install" in cmd:
-            if not validate_pip_command(cmd):
-                results.append(f"❌ {cmd} (Not allowed)")
-                continue
-            try:
-                progress_text = f"""
-🛠 **INSTALLING LIBRARIES**
-━━━━━━━━━━━━━━━━━━━━
-Installing ({i+1}/{len(commands)}):
-`{cmd}`
-━━━━━━━━━━━━━━━━━━━━
-                """
-                safe_edit_message_text(chat_id, old_mid, progress_text, parse_mode="Markdown")
-                
-                result = subprocess.run(cmd.split(), capture_output=True, text=True, timeout=60, check=False)
-                if result.returncode == 0:
-                    results.append(f"✅ {cmd}")
-                else:
-                    results.append(f"❌ {cmd} (Error: {result.stderr[:30]})")
-                
-                time.sleep(1)
-                
-            except subprocess.TimeoutExpired:
-                results.append(f"⏰ {cmd} (Timeout)")
-            except Exception as e:
-                results.append(f"⚠️ {cmd} (Error)")
-    
-    result_text = "\n".join(results)
-    final_text = f"""
-✅ **INSTALLATION COMPLETE**
-━━━━━━━━━━━━━━━━━━━━
-{result_text}
-━━━━━━━━━━━━━━━━━━━━
-All libraries installed successfully!
-    """
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🚀 Deploy Bot Now", callback_data="deploy_new"))
-    markup.add(types.InlineKeyboardButton("🤖 My Bots", callback_data="my_bots"))
-    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))  # ব্যাক বাটন
-    
-    safe_edit_message_text(chat_id, old_mid, final_text, reply_markup=markup, parse_mode="Markdown")
-    logger.info(f"User {uid} installed libraries.")
-
-def show_available_files(call):
-    uid = call.from_user.id
-    with get_db() as conn:
-        c = conn.cursor()
-        files = c.execute("SELECT filename, bot_name FROM deployments WHERE user_id=? AND (pid IS NULL OR pid=0) AND status='Uploaded'", (uid,)).fetchall()
-    
-    if not files:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("📤 Upload Bot", callback_data="upload"))
-        markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-        safe_edit_message_text(call.message.chat.id, call.message.message_id, 
-                               "📭 **No files available for deployment**\n\nUpload a file first.", 
-                               reply_markup=markup, parse_mode="Markdown")
-        return
-    
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for filename, bot_name in files:
-        markup.add(types.InlineKeyboardButton(f"🤖 {bot_name}", callback_data=f"deploy_{filename}"))
-    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_main"))
-    
-    text = """
-🚀 **DEPLOY BOT**
-━━━━━━━━━━━━━━━━━━━━
-Select a bot to deploy:
-━━━━━━━━━━━━━━━━━━━━
-    """
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-
-def start_deployment(call, filename):
-    uid = call.from_user.id
-    chat_id = call.message.chat.id
-    mid = call.message.message_id
-    
-    with get_db() as conn:
-        c = conn.cursor()
-        bot_info = c.execute("SELECT id, bot_name FROM deployments WHERE filename=? AND user_id=?", (filename, uid)).fetchone()
-        if not bot_info:
+    elif data.startswith("select:"):
+        _, poll_id, opt_idx = data.split(":")
+        opt_idx = int(opt_idx)
+        poll = get_poll(poll_id)
+        if not poll or not poll["is_active"]:
+            bot.answer_callback_query(call.id, "Poll closed.", show_alert=True)
             return
-        bot_id, bot_name = bot_info
-    
-    text = f"""
-🚀 **DEPLOYING BOT**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-🔄 **Status:** Initializing system...
-━━━━━━━━━━━━━━━━━━━━
-    """
-    safe_edit_message_text(chat_id, mid, text, parse_mode="Markdown")
-    time.sleep(1.5)
-    
-    text = f"""
-🚀 **DEPLOYING BOT**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-✅ **Step 1:** System initialized
-🔄 **Step 2:** Checking dependencies...
-━━━━━━━━━━━━━━━━━━━━
-    """
-    safe_edit_message_text(chat_id, mid, text, parse_mode="Markdown")
-    time.sleep(1.5)
-    
-    text = f"""
-🚀 **DEPLOYING BOT**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-✅ **Step 1:** System initialized
-✅ **Step 2:** Dependencies checked
-🔄 **Step 3:** Loading modules...
-━━━━━━━━━━━━━━━━━━━━
-    """
-    safe_edit_message_text(chat_id, mid, text, parse_mode="Markdown")
-    time.sleep(2)
-    
-    text = f"""
-🚀 **DEPLOYING BOT**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-✅ **Step 1:** System initialized
-✅ **Step 2:** Dependencies checked
-✅ **Step 3:** Modules loaded
-🔄 **Step 4:** Starting bot process...
-━━━━━━━━━━━━━━━━━━━━
-    """
-    safe_edit_message_text(chat_id, mid, text, parse_mode="Markdown")
-    time.sleep(1.5)
-    
-    try:
-        runner = BotRunner.run(uid, bot_id, filename, bot_name, auto_restart=False)
-        
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE deployments SET pid=?, container_id=?, start_time=?, status=? WHERE id=?",
-                      (runner.get('pid'), runner.get('container_id'), runner['start_time'], 'Running', bot_id))
-            conn.commit()
-        
-        text = f"""
-✅ **BOT DEPLOYED SUCCESSFULLY**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-📁 **File:** `{filename}`
-⚙️ **PID:** `{runner.get('pid') or 'Container'}`
-⏰ **Started:** {runner['start_time']}
-🔧 **Status:** **RUNNING**
-━━━━━━━━━━━━━━━━━━━━
-Bot is now active and running!
-        """
-        safe_edit_message_text(chat_id, mid, text, parse_mode="Markdown")
-        time.sleep(2)
-        
-        show_bot_live_stats(call, bot_id, bot_name, runner.get('pid'), runner.get('container_id'))
-        
-    except Exception as e:
-        logger.exception(f"Deployment failed for user {uid}, bot {bot_id}")
-        text = f"""
-❌ **DEPLOYMENT FAILED**
-━━━━━━━━━━━━━━━━━━━━
-Error: {str(e)}
-━━━━━━━━━━━━━━━━━━━━
-Please check your bot code and try again.
-        """
-        safe_edit_message_text(chat_id, mid, text, parse_mode="Markdown")
+        success, msg = add_vote(poll_id, user_id, opt_idx)
+        bot.answer_callback_query(call.id, msg, show_alert=not success)
+        if success:
+            log_action("vote", user_id, f"poll={poll_id}, option={opt_idx}")
+            # Show updated results if anonymous; else show nothing
+            if poll["anonymous"]:
+                counts, total = get_vote_counts(poll_id)
+                options = json.loads(poll["options"])
+                text = f"📊 {poll['question']}\n"
+                for i, opt in enumerate(options):
+                    text += f"• {opt}: {counts.get(i, 0)} votes\n"
+                text += f"Total: {total} votes"
+                bot.edit_message_text(text, chat_id, msg_id)
 
-def start_stopped_bot(call, bot_id):
-    """স্টপ করা বট আবার চালু করে"""
-    uid = call.from_user.id
-    chat_id = call.message.chat.id
-    mid = call.message.message_id
-    
-    with get_db() as conn:
-        c = conn.cursor()
-        bot_info = c.execute("SELECT filename, bot_name FROM deployments WHERE id=? AND user_id=?", (bot_id, uid)).fetchone()
-        if not bot_info:
-            bot.answer_callback_query(call.id, "❌ Bot not found!")
+    elif data.startswith("results:"):
+        poll_id = data.split(":")[1]
+        poll = get_poll(poll_id)
+        if not poll:
+            bot.answer_callback_query(call.id, "Poll not found.")
             return
-        filename, bot_name = bot_info
-    
-    # ডিপ্লয়মেন্ট স্টেপ স্কিপ করে সরাসরি চালানোর চেষ্টা
-    try:
-        runner = BotRunner.run(uid, bot_id, filename, bot_name, auto_restart=False)
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("UPDATE deployments SET pid=?, container_id=?, start_time=?, status=? WHERE id=?",
-                      (runner.get('pid'), runner.get('container_id'), runner['start_time'], 'Running', bot_id))
-            conn.commit()
-        
-        bot.answer_callback_query(call.id, "✅ Bot started successfully!")
-        # ডিটেইলস পৃষ্ঠা রিফ্রেশ
-        show_bot_details(call, bot_id)
-    except Exception as e:
-        logger.exception(f"Start failed for bot {bot_id}")
-        bot.answer_callback_query(call.id, f"❌ Failed to start: {str(e)[:30]}")
+        counts, total = get_vote_counts(poll_id)
+        options = json.loads(poll["options"])
+        text = f"📈 **{poll['question']}**\n"
+        for i, opt in enumerate(options):
+            text += f"• {opt}: {counts.get(i, 0)} votes\n"
+        text += f"**Total:** {total} votes\n"
+        if poll["close_at"]:
+            text += f"Closed: {datetime.fromtimestamp(poll['close_at']).strftime('%Y-%m-%d %H:%M')}"
+        bot.edit_message_text(text, chat_id, msg_id, parse_mode="Markdown")
 
-def show_bot_live_stats(call, bot_id, bot_name, pid, container_id):
-    chat_id = call.message.chat.id
-    mid = call.message.message_id
-    
-    def monitor_bot():
-        for i in range(10):
-            try:
-                stats = get_system_stats()
-                cpu_percent = stats['cpu_percent']
-                ram_percent = stats['ram_percent']
-                disk_percent = stats['disk_percent']
-                
-                update_bot_stats(bot_id, cpu_percent, ram_percent)
-                
-                cpu_bar = create_progress_bar(cpu_percent)
-                ram_bar = create_progress_bar(ram_percent)
-                disk_bar = create_progress_bar(disk_percent)
-                
-                if container_id and DOCKER_AVAILABLE:
-                    try:
-                        client = docker.from_env()
-                        container = client.containers.get(container_id)
-                        is_running = container.status == 'running'
-                    except:
-                        is_running = False
-                else:
-                    stat = get_process_stats(pid)
-                    is_running = stat and stat['running'] if stat else False
-                
-                status_icon = "🟢" if is_running else "🔴"
-                
-                text = f"""
-📊 **LIVE BOT STATISTICS** {status_icon}
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-⚙️ **PID/Container:** `{pid or container_id[:12] if container_id else 'N/A'}`
-⏰ **Uptime:** {i*5} seconds
-━━━━━━━━━━━━━━━━━━━━
-💻 **CPU Usage:** {cpu_bar} {cpu_percent:.1f}%
-🧠 **RAM Usage:** {ram_bar} {ram_percent:.1f}%
-💾 **Disk Usage:** {disk_bar} {disk_percent:.1f}%
-━━━━━━━━━━━━━━━━━━━━
-📈 **Server Performance:**
-• Download Speed: {random.randint(50, 100)} MB/s
-• Upload Speed: {random.randint(20, 50)} MB/s
-• Network Latency: {random.randint(10, 50)} ms
-• Response Time: {random.randint(1, 10)} ms
-━━━━━━━━━━━━━━━━━━━━
-🔄 **Status:** {"Running smoothly..." if is_running else "Process stopped"}
-                """
-                
-                try:
-                    bot.edit_message_text(text, chat_id, mid, parse_mode="Markdown")
-                except:
-                    pass
-                
-                time.sleep(5)
-                
-            except Exception as e:
-                logger.error(f"Monitor error: {e}")
-                break
-    
-    monitor_thread = threading.Thread(target=monitor_bot)
-    monitor_thread.daemon = True
-    monitor_thread.start()
-    
-    time.sleep(5)
-    text = f"""
-✅ **BOT IS NOW ACTIVE**
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot:** {bot_name}
-📊 **Status:** Live monitoring active
-🏃 **Process:** Running (PID: {pid or 'Container'})
-━━━━━━━━━━━━━━━━━━━━
-Live statistics will update every 5 seconds.
-    """
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🤖 My Bots", callback_data="my_bots"))
-    markup.add(types.InlineKeyboardButton("📊 View Stats", callback_data=f"bot_{bot_id}"))
-    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-    
-    safe_edit_message_text(chat_id, mid, text, reply_markup=markup, parse_mode="Markdown")
+    elif data.startswith("info:"):
+        poll_id = data.split(":")[1]
+        poll = get_poll(poll_id)
+        if not poll:
+            bot.answer_callback_query(call.id, "Not found.")
+            return
+        status = "✅ Active" if poll["is_active"] else "❌ Closed"
+        anon = "Anonymous" if poll["anonymous"] else "Public"
+        change = "Allowed" if poll["allow_vote_change"] else "Not allowed"
+        text = f"ℹ️ **Poll Info**\n"
+        text += f"ID: `{poll['poll_id']}`\n"
+        text += f"Question: {poll['question']}\n"
+        text += f"Status: {status}\n"
+        text += f"Anonymity: {anon}\n"
+        text += f"Vote change: {change}\n"
+        if poll["close_at"]:
+            text += f"Close time: {datetime.fromtimestamp(poll['close_at']).strftime('%Y-%m-%d %H:%M')}"
+        bot.edit_message_text(text, chat_id, msg_id, parse_mode="Markdown")
 
-def show_my_bots(call):
-    uid = call.from_user.id
-    bots = get_user_bots(uid)
-    
-    if not bots:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("📤 Upload Bot", callback_data="upload"))
-        markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-        
-        text = """
-🤖 **MY BOTS**
-━━━━━━━━━━━━━━━━━━━━
-No bots found. Upload your first bot!
-━━━━━━━━━━━━━━━━━━━━
-        """
-        safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-        return
-    
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for bot in bots:
-        bot_id, bot_name, filename, pid, start_time, status = bot
-        status_icon = "🟢" if status == "Running" else "🔴" if status == "Stopped" else "🟡"
-        button_text = f"{status_icon} {bot_name}"
-        markup.add(types.InlineKeyboardButton(button_text, callback_data=f"bot_{bot_id}"))
-    
-    markup.add(types.InlineKeyboardButton("📤 Upload New", callback_data="upload"))
-    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-    
-    running_count = sum(1 for b in bots if b[5] == "Running")
-    total_count = len(bots)
-    
-    text = f"""
-🤖 **MY BOTS**
-━━━━━━━━━━━━━━━━━━━━
-📊 **Stats:** {running_count}/{total_count} running
-━━━━━━━━━━━━━━━━━━━━
-Select a bot to view details:
-━━━━━━━━━━━━━━━━━━━━
-    """
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
+    # Owner management actions
+    elif data.startswith("manage:"):
+        if not is_owner(user_id):
+            bot.answer_callback_query(call.id, "Owner only.")
+            return
+        poll_id = data.split(":")[1]
+        poll = get_poll(poll_id)
+        if not poll:
+            bot.answer_callback_query(call.id, "No poll.")
+            return
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("❌ Suspend/Activate", callback_data=f"toggle:{poll_id}"))
+        markup.add(InlineKeyboardButton("🔄 Reset Votes", callback_data=f"reset:{poll_id}"))
+        markup.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete:{poll_id}"))
+        bot.edit_message_text(f"Manage: {poll['question']}", chat_id, msg_id, reply_markup=markup)
 
-def show_bot_details(call, bot_id):
-    with get_db() as conn:
-        c = conn.cursor()
-        bot_info = c.execute("SELECT * FROM deployments WHERE id=?", (bot_id,)).fetchone()
-    
-    if not bot_info:
-        bot.answer_callback_query(call.id, "❌ Bot not found!")
-        return
-    
-    bot_name = bot_info['bot_name']
-    filename = bot_info['filename']
-    pid = bot_info['pid']
-    container_id = bot_info['container_id']
-    start_time = bot_info['start_time']
-    status = bot_info['status']
-    cpu_usage = bot_info['cpu_usage'] or 0
-    ram_usage = bot_info['ram_usage'] or 0
-    
-    stats = get_system_stats()
-    cpu_usage = cpu_usage or stats['cpu_percent']
-    ram_usage = ram_usage or stats['ram_percent']
-    
-    cpu_bar = create_progress_bar(cpu_usage)
-    ram_bar = create_progress_bar(ram_usage)
-    
-    if container_id and DOCKER_AVAILABLE:
-        try:
-            client = docker.from_env()
-            container = client.containers.get(container_id)
-            is_running = container.status == 'running'
-        except:
-            is_running = False
-    else:
-        stat = get_process_stats(pid)
-        is_running = stat and stat['running'] if stat else False
-    
-    def calculate_uptime(start_time_str):
-        try:
-            start = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
-            uptime = datetime.now() - start
-            days = uptime.days
-            hours, remainder = divmod(uptime.seconds, 3600)
-            minutes, _ = divmod(remainder, 60)
-            if days > 0:
-                return f"{days}d {hours}h"
-            elif hours > 0:
-                return f"{hours}h {minutes}m"
-            else:
-                return f"{minutes}m"
-        except:
-            return "N/A"
-    
-    uptime = calculate_uptime(start_time) if start_time else "N/A"
-    
-    stats_text = f"""
-📊 **Current Stats:**
-• CPU: {cpu_bar} {cpu_usage:.1f}%
-• RAM: {ram_bar} {ram_usage:.1f}%
-• Status: {"🟢 Running" if is_running else "🔴 Stopped"}
-• Uptime: {uptime}
-    """
-    
-    text = f"""
-🤖 **BOT DETAILS**
-━━━━━━━━━━━━━━━━━━━━
-**Name:** {bot_name}
-**File:** `{filename}`
-**PID/Container:** `{pid if pid else container_id[:12] if container_id else "N/A"}`
-**Started:** {start_time if start_time else "Not started"}
-━━━━━━━━━━━━━━━━━━━━
-{stats_text}
-━━━━━━━━━━━━━━━━━━━━
-    """
-    
-    markup = types.InlineKeyboardMarkup()
-    if is_running:
-        markup.add(types.InlineKeyboardButton("🛑 Stop Bot", callback_data=f"stop_{bot_id}"))
-    else:
-        # বট বন্ধ বা ক্র্যাশ করা - স্টার্ট বাটন দেখাও
-        markup.add(types.InlineKeyboardButton("🚀 Start Bot", callback_data=f"start_{bot_id}"))
-    
-    markup.add(types.InlineKeyboardButton("📊 Refresh Stats", callback_data=f"bot_{bot_id}"))
-    markup.add(types.InlineKeyboardButton("🔙 My Bots", callback_data="my_bots"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
+    elif data.startswith("toggle:"):
+        if not is_owner(user_id):
+            bot.answer_callback_query(call.id, "Owner only.")
+            return
+        poll_id = data.split(":")[1]
+        poll = get_poll(poll_id)
+        if poll:
+            new_state = not poll["is_active"]
+            update_poll_status(poll_id, new_state)
+            log_action("toggle_poll", user_id, f"poll={poll_id}, active={new_state}")
+            bot.answer_callback_query(call.id, f"Poll {'activated' if new_state else 'suspended'}.", show_alert=True)
+        bot.delete_message(chat_id, msg_id)
 
-def stop_bot(call, bot_id):
-    with get_db() as conn:
-        c = conn.cursor()
-        bot_info = c.execute("SELECT pid, container_id FROM deployments WHERE id=?", (bot_id,)).fetchone()
-        if bot_info:
-            BotRunner.stop(bot_info['pid'], bot_info['container_id'])
-            c.execute("UPDATE deployments SET status='Stopped', pid=NULL, container_id=NULL WHERE id=?", (bot_id,))
-            conn.commit()
-    bot.answer_callback_query(call.id, "✅ Bot stopped successfully!")
-    show_bot_details(call, bot_id)
+    elif data.startswith("reset:"):
+        if not is_owner(user_id):
+            bot.answer_callback_query(call.id, "Owner only.")
+            return
+        poll_id = data.split(":")[1]
+        reset_votes(poll_id)
+        log_action("reset_votes", user_id, f"poll={poll_id}")
+        bot.answer_callback_query(call.id, "All votes reset.", show_alert=True)
 
-def show_dashboard(call):
-    uid = call.from_user.id
-    user = get_user(uid)
-    
-    if not user:
-        bot.answer_callback_query(call.id, "❌ User data not found")
-        return
-    
-    bots = get_user_bots(uid)
-    running_bots = sum(1 for b in bots if b[5] == "Running")
-    total_bots = len(bots)
-    
-    stats = get_system_stats()
-    cpu_usage = stats['cpu_percent']
-    ram_usage = stats['ram_percent']
-    disk_usage = stats['disk_percent']
-    
-    cpu_bar = create_progress_bar(cpu_usage)
-    ram_bar = create_progress_bar(ram_usage)
-    disk_bar = create_progress_bar(disk_usage)
-    
-    text = f"""
-📊 **USER DASHBOARD**
-━━━━━━━━━━━━━━━━━━━━
-👤 **Account Info:**
-• Status: {'PRIME👑' if is_prime(uid) else 'FREE 🆓'}
-• File Limit: {user['file_limit']} files
-• Expiry: {user['expiry'] if user['expiry'] else 'Not set'}
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot Statistics:**
-• Total Bots: {total_bots}
-• Running: {running_bots}
-• Stopped: {total_bots - running_bots}
-━━━━━━━━━━━━━━━━━━━━
-🖥️ **Server Status:**
-• CPU: {cpu_bar} {cpu_usage:.1f}%
-• RAM: {ram_bar} {ram_usage:.1f}%
-• Disk: {disk_bar} {disk_usage:.1f}%
-━━━━━━━━━━━━━━━━━━━━
-💻 **Hosting Platform:**
-• Platform: PRIME FLOW 
-• Type: Web Service 
-• Region: Asia/Sylhet🇧🇩
-━━━━━━━━━━━━━━━━━━━━
+    elif data.startswith("delete:"):
+        if not is_owner(user_id):
+            bot.answer_callback_query(call.id, "Owner only.")
+            return
+        poll_id = data.split(":")[1]
+        delete_poll(poll_id)
+        log_action("delete_poll", user_id, f"poll={poll_id}")
+        bot.answer_callback_query(call.id, "Poll deleted.", show_alert=True)
+        bot.delete_message(chat_id, msg_id)
+
+    elif data == "close:skip":
+        bot.edit_message_text("No close time set. Now choose anonymity:", chat_id, msg_id)
+        # Re-prompt anonymity using same logic
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Anonymous", callback_data="anon:1"),
+                   InlineKeyboardButton("Public", callback_data="anon:0"))
+        bot.send_message(chat_id, "Vote anonymity?", reply_markup=markup)
+
+# ==================== FLASK WEB BOARD ====================
+
+app = Flask(__name__)
+app.secret_key = FLASK_SECRET
+
+# Simple HTML templates (inline for zero dependencies)
+BASE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Voting Board - Instance {instance}</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: auto; padding: 20px; }
+        .poll { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        .vote-bar { background-color: #4CAF50; height: 20px; color: white; padding: 2px 5px; }
+        .admin { background: #f9f9f9; padding: 10px; border-left: 3px solid #f44336; }
+        .button { background: #008CBA; color: white; padding: 8px 12px; text-decoration: none; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <h1>🗳 Voting Board (Instance: {instance})</h1>
+    {content}
+</body>
+</html>
 """
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("🤖 My Bots", callback_data="my_bots"),
-        types.InlineKeyboardButton("🚀 Deploy", callback_data="deploy_new")
-    )
-    markup.add(
-        types.InlineKeyboardButton("📤 Upload", callback_data="upload"),
-        types.InlineKeyboardButton("🔄 Refresh", callback_data="dashboard")
-    )
-    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
 
-def admin_panel_callback(call):
-    text = """
-👑 **ADMIN DASHBOARD**
-━━━━━━━━━━━━━━━━━━━━
-Welcome to the admin control panel.
-Select an option below:
-━━━━━━━━━━━━━━━━━━━━
-    """
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=admin_menu(), parse_mode="Markdown")
-
-def show_all_users(call):
-    with get_db() as conn:
-        c = conn.cursor()
-        users = c.execute("SELECT id, username, expiry, file_limit, is_prime FROM users").fetchall()
-    
-    prime_count = sum(1 for u in users if u['is_prime'] == 1)
-    total_count = len(users)
-    
-    text = f"""
-👥 **ALL USERS**
-━━━━━━━━━━━━━━━━━━━━
-📊 **Total Users:** {total_count}
-👑 **Prime Users:** {prime_count}
-🆓 **Free Users:** {total_count - prime_count}
-━━━━━━━━━━━━━━━━━━━━
-**Recent Users:**
-"""
-    
-    for user in users[:10]:
-        username = user['username'] if user['username'] else f"User_{user['id']}"
-        text += f"\n• {username} (ID: {user['id']}) - {'Prime' if user['is_prime'] else 'Free'}"
-    
-    if len(users) > 10:
-        text += f"\n\n... and {len(users) - 10} more users"
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-
-def show_all_bots_admin(call):
-    with get_db() as conn:
-        c = conn.cursor()
-        bots = c.execute("SELECT d.bot_name, d.status, d.start_time, u.username FROM deployments d LEFT JOIN users u ON d.user_id = u.id").fetchall()
-    
-    running_bots = sum(1 for b in bots if b['status'] == "Running")
-    total_bots = len(bots)
-    
-    text = f"""
-🤖 **ALL BOTS**
-━━━━━━━━━━━━━━━━━━━━
-📊 **Total Bots:** {total_bots}
-🟢 **Running:** {running_bots}
-🔴 **Stopped:** {total_bots - running_bots}
-━━━━━━━━━━━━━━━━━━━━
-**Active Bots:**
-"""
-    
-    for bot_info in bots[:5]:
-        if bot_info['status'] == "Running":
-            username = bot_info['username'] if bot_info['username'] else "Unknown"
-            text += f"\n• {bot_info['bot_name']} (@{username}) - {bot_info['status']}"
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-
-def show_admin_stats(call):
-    with get_db() as conn:
-        c = conn.cursor()
-        total_users = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        prime_users = c.execute("SELECT COUNT(*) FROM users WHERE is_prime=1").fetchone()[0]
-        total_bots = c.execute("SELECT COUNT(*) FROM deployments").fetchone()[0]
-        running_bots = c.execute("SELECT COUNT(*) FROM deployments WHERE status='Running'").fetchone()[0]
-        total_keys = c.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
-    
-    stats = get_system_stats()
-    cpu_usage = stats['cpu_percent']
-    ram_usage = stats['ram_percent']
-    disk_usage = stats['disk_percent']
-    
-    text = f"""
-📈 **ADMIN STATISTICS**
-━━━━━━━━━━━━━━━━━━━━
-👥 **User Stats:**
-• Total Users: {total_users}
-• Prime Users: {prime_users}
-• Free Users: {total_users - prime_users}
-━━━━━━━━━━━━━━━━━━━━
-🤖 **Bot Stats:**
-• Total Bots: {total_bots}
-• Running Bots: {running_bots}
-• Stopped Bots: {total_bots - running_bots}
-━━━━━━━━━━━━━━━━━━━━
-🔑 **Key Stats:**
-• Total Keys: {total_keys}
-━━━━━━━━━━━━━━━━━━━━
-🖥️ **System Status:**
-• CPU Usage: {cpu_usage:.1f}%
-• RAM Usage: {ram_usage:.1f}%
-• Disk Usage: {disk_usage:.1f}%
-━━━━━━━━━━━━━━━━━━━━
-🌐 **Hosting Info:**
-• Platform: XPON 
-• Port: {Config.PORT}
-• Database: oringe-print🍊
-━━━━━━━━━━━━━━━━━━━━
-"""
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("👥 Users", callback_data="all_users"),
-        types.InlineKeyboardButton("🤖 Bots", callback_data="all_bots")
-    )
-    markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-
-def toggle_maintenance(call):
-    Config.MAINTENANCE = not Config.MAINTENANCE
-    status = "ENABLED 🔴" if Config.MAINTENANCE else "DISABLED 🟢"
-    text = f"""
-⚙️ **MAINTENANCE MODE**
-━━━━━━━━━━━━━━━━━━━━
-Status: {status}
-━━━━━━━━━━━━━━━━━━━━
-Maintenance mode has been {'enabled' if Config.MAINTENANCE else 'disabled'}.
-Only admin can access the system when enabled.
-━━━━━━━━━━━━━━━━━━━━
-"""
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-
-def show_prime_info(call):
-    text = """
-👑 **PRIME FEATURES**
-━━━━━━━━━━━━━━━━━━━━
-✅ **Unlimited Bot Deployment**
-✅ **Priority Support**
-✅ **Advanced Monitoring**
-✅ **Custom Bot Names**
-✅ **Library Installation**
-✅ **Live Statistics**
-✅ **24/7 Server Uptime**
-✅ **No Ads**
-━━━━━━━━━━━━━━━━━━━━
-💎 **Get Prime Today!**
-Click 'Activate Prime Pass' and enter your key.
-━━━━━━━━━━━━━━━━━━━━
-"""
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🔑 Activate Prime", callback_data="activate_prime"))
-    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-
-def show_settings(call):
-    uid = call.from_user.id
-    user = get_user(uid)
-    
-    if not user:
-        bot.answer_callback_query(call.id, "❌ User data not found")
-        return
-    
-    text = f"""
-⚙️ **SETTINGS**
-━━━━━━━━━━━━━━━━━━━━
-👤 **Account Settings:**
-• User ID: `{uid}`
-• Status: {'Prime 👑' if is_prime(uid) else 'Free 🆓'}
-• File Limit: {user['file_limit']} files
-━━━━━━━━━━━━━━━━━━━━
-🔧 **Bot Settings:**
-• Auto-restart: Disabled
-• Notifications: Enabled
-• Language: English
-━━━━━━━━━━━━━━━━━━━━
-⚠️ **Danger Zone:**
-• Delete Account
-• Reset Settings
-━━━━━━━━━━━━━━━━━━━━
-🌐 **Hosting Info:**
-• Platform: PRIME FLOW 
-• Port: {Config.PORT}
-• Database: orange-print🍊
-━━━━━━━━━━━━━━━━━━━━
-"""
-    
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("🔔 Notifications", callback_data="notif_settings"),
-        types.InlineKeyboardButton("🌐 Language", callback_data="lang_settings")
-    )
-    markup.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="back_main"))
-    
-    safe_edit_message_text(call.message.chat.id, call.message.message_id, text, reply_markup=markup, parse_mode="Markdown")
-
-def process_key_step(message, old_mid):
-    uid = message.from_user.id
-    key_input = message.text.strip().upper()
-    
-    bot.delete_message(message.chat.id, message.message_id)
-    
-    with get_db() as conn:
-        c = conn.cursor()
-        res = c.execute("SELECT * FROM keys WHERE key=?", (key_input,)).fetchone()
-        
-        if res:
-            days = res['duration_days']
-            limit = res['file_limit']
-            expiry_date = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
-            
-            c.execute("UPDATE users SET expiry=?, file_limit=?, is_prime=1 WHERE id=?", (expiry_date, limit, uid))
-            c.execute("DELETE FROM keys WHERE key=?", (key_input,))
-            conn.commit()
-            
-            text = f"""
-✅ **PRIME ACTIVATED!**
-━━━━━━━━━━━━━━━━━━━━
-🎉 Congratulations! You are now a Prime member.
-━━━━━━━━━━━━━━━━━━━━
-📅 **Expiry:** {expiry_date}
-📦 **File Limit:** {limit} files
-━━━━━━━━━━━━━━━━━━━━
-Enjoy all premium features!
-            """
-            
-            safe_edit_message_text(message.chat.id, old_mid, text, reply_markup=main_menu(uid), parse_mode="Markdown")
-            logger.info(f"User {uid} activated prime with key {key_input}")
-        else:
-            text = """
-❌ **INVALID KEY**
-━━━━━━━━━━━━━━━━━━━━
-The key you entered is invalid or expired.
-━━━━━━━━━━━━━━━━━━━━
-Please check the key and try again.
-            """
-            safe_edit_message_text(message.chat.id, old_mid, text, reply_markup=main_menu(uid), parse_mode="Markdown")
-
-# ==================== ফ্লাস্ক রুট ====================
 @app.route('/')
-def home():
+def index():
+    """Public board: list all active polls with current results."""
+    polls = get_all_polls(active_only=True)
+    html = "<h2>Active Polls</h2>"
+    if not polls:
+        html += "<p>No active polls.</p>"
+    else:
+        for p in polls:
+            html += f"<div class='poll'><h3>{p['question']}</h3>"
+            counts, total = get_vote_counts(p['poll_id'])
+            options = json.loads(p['options'])
+            for idx, opt in enumerate(options):
+                count = counts.get(idx, 0)
+                percent = (count / total * 100) if total > 0 else 0
+                html += f"<p><strong>{opt}</strong>: {count} votes</p>"
+                html += f"<div class='vote-bar' style='width: {percent}%;'>{percent:.1f}%</div>"
+            html += f"<p>Total votes: {total}</p>"
+            if p['close_at']:
+                html += f"<p>⏳ Closes: {datetime.fromtimestamp(p['close_at']).strftime('%Y-%m-%d %H:%M')}</p>"
+            html += "</div>"
+    return BASE_HTML.format(instance=INSTANCE_ID[:8], content=html)
+
+@app.route('/poll/<poll_id>')
+def poll_detail(poll_id):
+    """Detailed results for a specific poll (even if closed)."""
+    poll = get_poll(poll_id)
+    if not poll:
+        return "Poll not found", 404
+    counts, total = get_vote_counts(poll_id)
+    options = json.loads(poll['options'])
+    html = f"<h2>{poll['question']}</h2>"
+    html += f"<p>Status: {'✅ Active' if poll['is_active'] else '❌ Closed'}</p>"
+    html += f"<p>Type: {'Anonymous' if poll['anonymous'] else 'Public'}</p>"
+    for idx, opt in enumerate(options):
+        count = counts.get(idx, 0)
+        percent = (count / total * 100) if total > 0 else 0
+        html += f"<p><strong>{opt}</strong>: {count} votes</p>"
+        html += f"<div class='vote-bar' style='width: {percent}%;'>{percent:.1f}%</div>"
+    html += f"<p>Total votes: {total}</p>"
+    if poll['close_at']:
+        html += f"<p>Closes: {datetime.fromtimestamp(poll['close_at']).strftime('%Y-%m-%d %H:%M')}</p>"
+    return BASE_HTML.format(instance=INSTANCE_ID[:8], content=html)
+
+# -------------------- Admin Panel --------------------
+@app.route('/admin', methods=['GET', 'POST'])
+def admin_login():
+    """Simple login form asking for Core Key and Instance Secret."""
+    if request.method == 'POST':
+        core = request.form.get('core_key')
+        secret = request.form.get('instance_secret')
+        if verify_admin_credentials(core, secret):
+            session['admin'] = True
+            return redirect(url_for('admin_dashboard'))
+        else:
+            return "<h2>Invalid credentials</h2><a href='/admin'>Try again</a>"
     html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>🤖 unique Bot Hosting v3.2</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                margin: 0;
-                padding: 20px;
-                min-height: 100vh;
-            }
-            .container {
-                max-width: 800px;
-                margin: 0 auto;
-                background: rgba(255, 255, 255, 0.1);
-                padding: 30px;
-                border-radius: 15px;
-                backdrop-filter: blur(10px);
-                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
-            }
-            h1 {
-                text-align: center;
-                font-size: 2.5em;
-                margin-bottom: 30px;
-                color: #fff;
-            }
-            .status {
-                background: rgba(255, 255, 255, 0.2);
-                padding: 20px;
-                border-radius: 10px;
-                margin: 20px 0;
-                border-left: 5px solid #4CAF50;
-            }
-            .feature {
-                background: rgba(255, 255, 255, 0.15);
-                padding: 15px;
-                margin: 10px 0;
-                border-radius: 8px;
-                display: flex;
-                align-items: center;
-            }
-            .feature i {
-                margin-right: 15px;
-                font-size: 1.5em;
-            }
-            .stats {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 15px;
-                margin: 30px 0;
-            }
-            .stat-box {
-                background: rgba(255, 255, 255, 0.2);
-                padding: 20px;
-                border-radius: 10px;
-                text-align: center;
-            }
-            .btn {
-                display: inline-block;
-                background: linear-gradient(45deg, #FF416C, #FF4B2B);
-                color: white;
-                padding: 12px 30px;
-                border-radius: 25px;
-                text-decoration: none;
-                font-weight: bold;
-                margin: 10px 5px;
-                transition: transform 0.3s;
-            }
-            .btn:hover {
-                transform: translateY(-3px);
-            }
-            .footer {
-                text-align: center;
-                margin-top: 40px;
-                padding-top: 20px;
-                border-top: 1px solid rgba(255, 255, 255, 0.3);
-            }
-        </style>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    </head>
-    <body>
-        <div class="container">
-            <h1><i class="fas fa-robot"></i> Prime Bot Hosting v3.2</h1>
-            
-            <div class="status">
-                <h2><i class="fas fa-server"></i> Server Status: <span style="color: #4CAF50;">✅ ONLINE</span></h2>
-                <p>Bot hosting service is running securely with rate limiting, resource control, and auto-restart.</p>
-            </div>
-            
-            <div class="stats">
-                <div class="stat-box">
-                    <i class="fas fa-users"></i>
-                    <h3>Active Users</h3>
-                    <p>24/7 Service</p>
-                </div>
-                <div class="stat-box">
-                    <i class="fas fa-robot"></i>
-                    <h3>Bot Hosting</h3>
-                    <p>Unlimited Deployment</p>
-                </div>
-                <div class="stat-box">
-                    <i class="fas fa-shield-alt"></i>
-                    <h3>Secure</h3>
-                    <p>Protected Environment</p>
-                </div>
-                <div class="stat-box">
-                    <i class="fas fa-bolt"></i>
-                    <h3>Fast</h3>
-                    <p>High Performance</p>
-                </div>
-            </div>
-            
-            <h2><i class="fas fa-star"></i> Premium Features</h2>
-            
-            <div class="feature">
-                <i class="fas fa-upload"></i>
-                <div>
-                    <h3>Bot File Upload</h3>
-                    <p>Upload and deploy your Python bots easily</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-chart-line"></i>
-                <div>
-                    <h3>Live Statistics</h3>
-                    <p>Real-time monitoring of your bots</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-cogs"></i>
-                <div>
-                    <h3>Library Installation</h3>
-                    <p>Install required libraries automatically</p>
-                </div>
-            </div>
-            
-            <div class="feature">
-                <i class="fas fa-tachometer-alt"></i>
-                <div>
-                    <h3>Performance Dashboard</h3>
-                    <p>Monitor CPU, RAM, and disk usage</p>
-                </div>
-            </div>
-            
-            <div style="text-align: center; margin: 40px 0;">
-                <a href="https://t.me/q1_host_bot" class="btn" target="_blank">
-                    <i class="fab fa-telegram"></i> Start on Telegram
-                </a>
-                <a href="https://cyber20un.onrender.com" class="btn" target="_blank" style="background: linear-gradient(45deg, #00b09b, #96c93d);">
-                    <i class="fas fa-cloud"></i> Hosted on cyber20
-                </a>
-            </div>
-            
-            <div class="footer">
-                <p><i class="fas fa-info-circle"></i> System Port: """ + str(Config.PORT) + """ | Python 3.9+ | SQLite Database</p>
-                <p>© 2022 ZQ Bot Hosting. All rights reserved by KI VAIYA 😁</p>
-            </div>
-        </div>
-    </body>
-    </html>
+    <h2>Admin Login</h2>
+    <form method="post">
+        <label>Core Key:</label><br>
+        <input type="password" name="core_key"><br>
+        <label>Instance Secret:</label><br>
+        <input type="password" name="instance_secret"><br><br>
+        <input type="submit" value="Login" class="button">
+    </form>
     """
-    return render_template_string(html)
+    return BASE_HTML.format(instance=INSTANCE_ID[:8], content=html)
 
-@app.route('/health')
-def health():
-    return {"status": "healthy", "service": "ZQ Bot Hosting v3.2", "port": Config.PORT, "maintenance": Config.MAINTENANCE}
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('admin'):
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    return decorated
 
-# ==================== বট ও সার্ভার রানার ====================
-def start_bot():
-    logger.info("🤖 BOT RUNNING 👾")
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            logger.exception(f"Bot polling crashed: {e}")
-            time.sleep(5)
+@app.route('/admin/dashboard')
+@admin_required
+def admin_dashboard():
+    """Admin overview with management options."""
+    polls = get_all_polls(active_only=False)
+    html = "<h2>Admin Dashboard</h2>"
+    html += "<div class='admin'>"
+    html += f"<p>Instance ID: {INSTANCE_ID}</p>"
+    html += f"<p>Total polls: {len(polls)}</p>"
+    html += "<h3>Polls</h3><ul>"
+    for p in polls:
+        html += f"<li>{p['question']} - "
+        html += f"<a href='/admin/poll/{p['poll_id']}/delete'>Delete</a> | "
+        html += f"<a href='/admin/poll/{p['poll_id']}/reset'>Reset votes</a> | "
+        html += f"<a href='/admin/poll/{p['poll_id']}/toggle'>{'Suspend' if p['is_active'] else 'Activate'}</a></li>"
+    html += "</ul>"
+    html += "<hr>"
+    html += f"<p><a href='/admin/export' class='button'>📥 Export Database</a></p>"
+    html += f"<p><a href='/admin/shutdown' class='button' style='background:#f44336;' onclick='return confirm(\"Shutdown entire system?\")'>🛑 Shutdown Server</a></p>"
+    html += "</div>"
+    return BASE_HTML.format(instance=INSTANCE_ID[:8], content=html)
 
-if __name__ == '__main__':
-    logger.info(f"""
-🤖 PRIME BOT HOSTING v3.2
-━━━━━━━━━━━━━━━━━━━━
-🚀 Starting on Zen bot
-• Port: {Config.PORT}
-• Admin ID: {Config.ADMIN_ID}
-• Database: ✅ (WAL mode)
-• Project Directory: ✅
-• Docker: {'✅' if DOCKER_AVAILABLE else '❌'}
-• psutil: {'✅' if PSUTIL_AVAILABLE else '❌'}
-━━━━━━━━━━━━━━━━━━━━
-    """)
-    
-    bot_thread = threading.Thread(target=start_bot, daemon=True)
+@app.route('/admin/poll/<poll_id>/delete')
+@admin_required
+def admin_delete_poll(poll_id):
+    delete_poll(poll_id)
+    log_action("admin_delete_poll", details=f"poll={poll_id}")
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/poll/<poll_id>/reset')
+@admin_required
+def admin_reset_poll(poll_id):
+    reset_votes(poll_id)
+    log_action("admin_reset_votes", details=f"poll={poll_id}")
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/poll/<poll_id>/toggle')
+@admin_required
+def admin_toggle_poll(poll_id):
+    poll = get_poll(poll_id)
+    if poll:
+        update_poll_status(poll_id, not poll["is_active"])
+        log_action("admin_toggle_poll", details=f"poll={poll_id}")
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/export')
+@admin_required
+def admin_export():
+    """Send the SQLite file as download."""
+    from flask import send_file
+    log_action("admin_export_db")
+    return send_file(DB_FILE, as_attachment=True, download_name=f"instance_{INSTANCE_ID}.db")
+
+@app.route('/admin/shutdown')
+@admin_required
+def admin_shutdown():
+    log_action("admin_shutdown")
+    # Shutdown after short delay
+    threading.Timer(1.0, lambda: os._exit(0)).start()
+    return "<h2>Shutting down...</h2><p>You can close this window.</p>"
+
+# ==================== MAIN LAUNCHER ====================
+
+def run_flask():
+    """Start Flask development server on the specified port."""
+    logger.info(f"Starting Flask board on http://127.0.0.1:{PORT}")
+    app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
+
+def run_bot():
+    """Start Telegram bot polling (blocking)."""
+    logger.info("Starting Telegram bot...")
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        logger.error(f"Bot polling error: {e}")
+
+def main():
+    """Initialize everything and run both services concurrently."""
+    init_database()
+    # Start bot in background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
-    
-    logger.info(f"✅ Telegram bot started in background")
-    logger.info(f"🌐 Flask server starting on port {Config.PORT}")
-    
-    app.run(host='0.0.0.0', port=Config.PORT, debug=False, use_reloader=False)
+    # Run Flask in main thread
+    run_flask()
+
+if __name__ == "__main__":
+    main()
