@@ -1,4 +1,0 @@
-pyTeleBotAPI
-Flask
-python-dotenv
-psutil               # optional, for CPU/RAM monitoring
